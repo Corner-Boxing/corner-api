@@ -32,27 +32,29 @@ def home():
 @app.route("/generate", methods=["POST"])
 def generate():
     """
-    This ONLY creates a small job record in Supabase:
+    Creates a job in the Supabase 'jobs' table with:
+
       jobs.status = 'queued'
       jobs.plan = {
-        difficulty, length_min, pace, music
+         difficulty, length_min, pace, music
       }
 
-    The worker backend will later read this, rebuild the full
-    class plan, generate audio, and update file_url/status.
+    The local worker will pick it up, generate the actual audio,
+    and update file_url + status later.
     """
     try:
         data = request.get_json() or {}
     except Exception:
-        data = {}
+        return jsonify({"status": "error", "error": "Invalid JSON"}), 400
 
+    # Read and normalize incoming values
     difficulty = (data.get("difficulty") or "beginner").lower()
-    length_min = int(data.get("length") or 60)
-    pace = data.get("pace") or "Normal"
-    music = data.get("music") or "None"
+    length_min = int(data.get("length") or 30)
+    pace = str(data.get("pace") or "Normal")
+    music = str(data.get("music") or "None")
 
-    # SMALL, SAFE PAYLOAD — no "segments" here
-    small_plan = {
+    # Prepare EXACT plan format the worker expects
+    plan = {
         "difficulty": difficulty,
         "length_min": length_min,
         "pace": pace,
@@ -60,12 +62,15 @@ def generate():
     }
 
     try:
+        # Insert a clean job row
         result = (
             supabase
             .table("jobs")
             .insert({
                 "status": "queued",
-                "plan": small_plan,
+                "plan": plan,      # Worker reads job["plan"]
+                "error": None,
+                "file_url": None,
             })
             .execute()
         )
