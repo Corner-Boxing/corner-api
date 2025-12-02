@@ -4,18 +4,30 @@ from flask_cors import CORS
 from supabase import create_client, Client
 
 # -------------------------
-# Flask + Supabase
+# Flask + CORS
 # -------------------------
 
 app = Flask(__name__)
 CORS(app)
 
-SUPABASE_URL = "https://lbhmfkmrluoropzfleaa.supabase.co"
-SUPABASE_KEY = (
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxiaG1m"
-    "a21ybHVvcm9wemZsZWFhIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2MzIyMjAyOSwi"
-    "ZXhwIjoyMDc4Nzk4MDI5fQ.Bmqu3Y9Woe4JPVO9bNviXN9ePJWc0LeIsItLjUT2mgQ"
-)
+# -------------------------
+# Supabase Client (SAFE)
+# -------------------------
+# These MUST come from Render environment variables:
+#
+#   SUPABASE_URL
+#   SUPABASE_SERVICE_KEY
+#
+# NEVER hardcode them — Render will lose them on redeploy.
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY") or os.getenv("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise RuntimeError(
+        "Missing SUPABASE_URL or SUPABASE_SERVICE_KEY. "
+        "Make sure they are set in the Render dashboard."
+    )
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -34,26 +46,30 @@ def generate():
     """
     Creates a job in the Supabase 'jobs' table with:
 
-      jobs.status = 'queued'
-      jobs.plan = {
-         difficulty, length_min, pace, music
-      }
+         status = 'queued'
+         plan = {
+             difficulty,
+             length_min,
+             pace,
+             music
+         }
 
-    The local worker will pick it up, generate the actual audio,
-    and update file_url + status later.
+    The local Corner Worker picks it up and generates audio.
     """
+
+    # ---- Safe JSON Parsing ----
     try:
-        data = request.get_json() or {}
+        data = request.get_json(force=True, silent=True) or {}
     except Exception:
         return jsonify({"status": "error", "error": "Invalid JSON"}), 400
 
-    # Read and normalize incoming values
+    # ---- Normalize incoming payload ----
     difficulty = (data.get("difficulty") or "beginner").lower()
     length_min = int(data.get("length") or 30)
     pace = str(data.get("pace") or "Normal")
     music = str(data.get("music") or "None")
 
-    # Prepare EXACT plan format the worker expects
+    # EXACT structure the worker expects
     plan = {
         "difficulty": difficulty,
         "length_min": length_min,
@@ -61,14 +77,14 @@ def generate():
         "music": music,
     }
 
+    # ---- Insert job row ----
     try:
-        # Insert a clean job row
         result = (
             supabase
             .table("jobs")
             .insert({
                 "status": "queued",
-                "plan": plan,      # Worker reads job["plan"]
+                "plan": plan,
                 "error": None,
                 "file_url": None,
             })
@@ -86,6 +102,10 @@ def generate():
         }), 500
 
 
+# -------------------------
+# Run for Render
+# -------------------------
+
 if __name__ == "__main__":
-    # Render expects port 10000
+    # Render requires port 10000
     app.run(host="0.0.0.0", port=10000)
