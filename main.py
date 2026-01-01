@@ -1,4 +1,6 @@
 import os
+import base64
+import json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client, Client
@@ -10,9 +12,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_KEY:
-    raise RuntimeError(
-        "Missing SUPABASE_URL or SUPABASE_SERVICE_KEY in Render env vars."
-    )
+    raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SERVICE_KEY in Render env vars.")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
@@ -39,26 +39,56 @@ def normalize_plan(payload: dict):
     if music.lower() in ("none", "no", "off", "coach only", "coach-only"):
         music = "none"
 
-    worker_plan = {
+    return {
         "difficulty": difficulty,
         "length_min": length_min,
         "pace": pace,
         "music": music,
     }
-    return worker_plan
 
-def supa_ok(resp):
+def supa_err(resp):
     # supabase-py responses typically have: data, error
     err = getattr(resp, "error", None)
-    if err:
-        # err may be dict-like or an object
-        msg = getattr(err, "message", None) or getattr(err, "msg", None) or str(err)
-        return False, msg
-    return True, None
+    if not err:
+        return None
+    # err may be dict-like or an object
+    msg = getattr(err, "message", None) or getattr(err, "msg", None)
+    return msg or str(err)
+
+def jwt_claims(jwt: str):
+    """
+    SAFE: decode payload WITHOUT verifying signature, and return non-sensitive claims.
+    We do NOT return the token or any secret, just decoded claims like 'role'.
+    """
+    try:
+        parts = jwt.split(".")
+        if len(parts) < 2:
+            return {}
+        payload_b64 = parts[1]
+        # add padding
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        payload = base64.urlsafe_b64decode(payload_b64.encode("utf-8")).decode("utf-8")
+        return json.loads(payload)
+    except Exception:
+        return {}
 
 @app.route("/")
 def home():
     return "Corner API OK"
+
+@app.route("/_whoami")
+def whoami():
+    claims = jwt_claims(SUPABASE_SERVICE_KEY)
+    # return only the useful bits
+    return jsonify({
+        "supabase_url_set": bool(SUPABASE_URL),
+        "key_claims": {
+            "role": claims.get("role"),
+            "ref": claims.get("ref"),
+            "iat": claims.get("iat"),
+            "exp": claims.get("exp"),
+        }
+    })
 
 @app.route("/generate", methods=["POST"])
 def generate():
@@ -82,12 +112,12 @@ def generate():
         .execute()
     )
 
-    ok, err = supa_ok(job_res)
-    if not ok or not job_res.data:
+    job_err = supa_err(job_res)
+    if job_err or not job_res.data:
         return jsonify({
             "status": "error",
             "error": "Failed to create job row",
-            "details": err or "Unknown Supabase error",
+            "details": job_err or "Unknown Supabase error",
         }), 500
 
     job_id = job_res.data[0].get("id")
@@ -106,23 +136,19 @@ def generate():
             "error": None,
             "started_at": None,
             "completed_at": None,
-            # user_id intentionally omitted until auth is wired
         })
         .execute()
     )
 
-    ok, err = supa_ok(sess_res)
-    if not ok:
-        # rollback job row if session fails
-        rb_res = supabase.table("jobs").delete().eq("id", job_id).execute()
-        rb_ok, rb_err = supa_ok(rb_res)
+    sess_err = supa_err(sess_res)
+    if sess_err:
+        # rollback job row if session fails (best-effort)
+        supabase.table("jobs").delete().eq("id", job_id).execute()
 
         return jsonify({
             "status": "error",
             "error": "class_sessions insert failed",
-            "details": err,
-            "rollback": "ok" if rb_ok else "failed",
-            "rollback_details": None if rb_ok else rb_err,
+            "details": sess_err,
             "job_id": str(job_id),
         }), 500
 
