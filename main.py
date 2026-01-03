@@ -79,39 +79,6 @@ def jwt_claims(jwt: str):
     except Exception:
         return {}
 
-def get_user_id_from_request():
-    """
-    If the client sends Authorization: Bearer <JWT>,
-    validate it via Supabase and return user.id.
-
-    If missing/invalid => None (anon allowed).
-    """
-    auth_header = request.headers.get("Authorization") or ""
-    if not auth_header.lower().startswith("bearer "):
-        return None
-
-    token = auth_header.split(" ", 1)[1].strip()
-    if not token:
-        return None
-
-    try:
-        user_resp = supabase.auth.get_user(token)
-
-        # supabase-py shape can vary; handle common shapes
-        if isinstance(user_resp, dict):
-            user = user_resp.get("user")
-        else:
-            user = getattr(user_resp, "user", None)
-
-        if not user:
-            return None
-
-        if isinstance(user, dict):
-            return user.get("id")
-        return getattr(user, "id", None)
-    except Exception:
-        return None
-
 @app.route("/")
 def home():
     return "Corner API OK"
@@ -128,16 +95,6 @@ def whoami():
             "exp": claims.get("exp"),
         }
     })
-
-def get_user_id_from_request():
-    auth = request.headers.get("Authorization") or ""
-    if not auth.lower().startswith("bearer "):
-        return None
-
-    token = auth.split(" ", 1)[1].strip()
-    claims = jwt_claims(token)  # your existing helper (no verify, ok for reading sub)
-    # Supabase user id is usually in "sub"
-    return claims.get("sub")
 
 @app.route("/generate", methods=["POST"])
 def generate():
