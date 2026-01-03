@@ -205,15 +205,19 @@ def generate():
         if not job_id:
             return jsonify({"status": "error", "error": "Job row missing id"}), 500
 
-        # ---- 2) Create class_sessions row ----
-        sess_payload = {
+     # 2) Create class_sessions row
+    sess_res = (
+        supabase
+        .table("class_sessions")
+        .insert({
             "job_id": job_id,
+            "user_id": user_id,  # <-- keep this line if your main.py already has user_id; if not, delete it
             "status": "queued",
             "plan": plan,
 
-            # mirrored convenience fields (you have these columns)
+            # denormalized fields (match your real column names)
             "difficulty": plan.get("difficulty"),
-            "length_": plan.get("length_min"),
+            "length_min": plan.get("length_min"),
             "pace": plan.get("pace"),
             "music": plan.get("music"),
 
@@ -222,9 +226,9 @@ def generate():
             "started_at": None,
             "completed_at": None,
             "storage_path": None,
-            "is_public": False,
-            "user_id": user_id,  # <-- THIS is the whole point
-        }
+        })
+        .execute()
+    )
 
         sess_res = supabase.table("class_sessions").insert(sess_payload).execute()
         sess_err = supa_err(sess_res)
