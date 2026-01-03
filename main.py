@@ -141,81 +141,121 @@ def get_user_id_from_request():
 
 @app.route("/generate", methods=["POST"])
 def generate():
+    """
+    Creates:
+      1) jobs row (status=queued)
+      2) class_sessions row (status=queued, job_id=jobs.id, user_id if available)
+
+    IMPORTANT:
+      - Never crash on auth issues.
+      - Always return JSON (even on internal errors).
+    """
     try:
-        data = request.get_json(force=True, silent=True) or {}
-    except Exception:
-        return jsonify({"status": "error", "error": "Invalid JSON"}), 400
+        # ---- Parse JSON body safely ----
+        try:
+            data = request.get_json(force=True, silent=True) or {}
+        except Exception:
+            return jsonify({"status": "error", "error": "Invalid JSON"}), 400
 
-    plan = normalize_plan(data)
+        plan = normalize_plan(data)
 
-    user_id = get_user_id_from_request()
-    print(f"[generate] auth_header_present={bool(request.headers.get('Authorization'))} user_id={user_id}")
+        # ---- Extract bearer token (optional) ----
+        user_id = None
+        try:
+            auth_header = request.headers.get("Authorization") or ""
+            if auth_header.lower().startswith("bearer "):
+                token = auth_header.split(" ", 1)[1].strip()
 
-    # optional (logged-in) user association
-    user_id = get_user_id_from_request()
+                # Use Supabase Auth to validate token and get user id.
+                # If this fails for ANY reason, we just treat as anonymous.
+                try:
+                    user_res = supabase.auth.get_user(token)
+                    # supabase-py response shapes vary; handle both
+                    user_obj = getattr(user_res, "user", None) or getattr(getattr(user_res, "data", None), "user", None)
+                    if user_obj and getattr(user_obj, "id", None):
+                        user_id = user_obj.id
+                except Exception:
+                    user_id = None
+        except Exception:
+            user_id = None
 
-    # 1) Create job row
-    job_payload = {
-        "status": "queued",
-        "plan": plan,
-        "error": None,
-        "file_url": None,
-    }
+        # ---- 1) Create job row ----
+        job_res = (
+            supabase
+            .table("jobs")
+            .insert({
+                "status": "queued",
+                "plan": plan,
+                "error": None,
+                "file_url": None,
+                "storage_path": None,
+            })
+            .execute()
+        )
 
-    # If your jobs table has user_id, attach it when present.
-    # If the column doesn't exist, Supabase will error—so we add it only when we actually have a user.
-    if user_id:
-        job_payload["user_id"] = user_id
+        job_err = supa_err(job_res)
+        if job_err or not getattr(job_res, "data", None):
+            return jsonify({
+                "status": "error",
+                "error": "Failed to create job row",
+                "details": job_err or "Unknown Supabase error",
+            }), 500
 
-    job_res = supabase.table("jobs").insert(job_payload).execute()
+        job_id = job_res.data[0].get("id")
+        if not job_id:
+            return jsonify({"status": "error", "error": "Job row missing id"}), 500
 
-    job_err = supa_err(job_res)
-    if job_err or not job_res.data:
+        # ---- 2) Create class_sessions row ----
+        sess_payload = {
+            "job_id": job_id,
+            "status": "queued",
+            "plan": plan,
+
+            # mirrored convenience fields (you have these columns)
+            "difficulty": plan.get("difficulty"),
+            "length_": plan.get("length_min"),
+            "pace": plan.get("pace"),
+            "music": plan.get("music"),
+
+            "file_url": None,
+            "error": None,
+            "started_at": None,
+            "completed_at": None,
+            "storage_path": None,
+            "is_public": False,
+            "user_id": user_id,  # <-- THIS is the whole point
+        }
+
+        sess_res = supabase.table("class_sessions").insert(sess_payload).execute()
+        sess_err = supa_err(sess_res)
+        if sess_err:
+            # rollback job row if session fails (best-effort)
+            try:
+                supabase.table("jobs").delete().eq("id", job_id).execute()
+            except Exception:
+                pass
+
+            return jsonify({
+                "status": "error",
+                "error": "class_sessions insert failed",
+                "details": sess_err,
+                "job_id": str(job_id),
+            }), 500
+
         return jsonify({
-            "status": "error",
-            "error": "Failed to create job row",
-            "details": job_err or "Unknown Supabase error",
-        }), 500
-
-    job_id = job_res.data[0].get("id")
-    if not job_id:
-        return jsonify({"status": "error", "error": "Job row missing id"}), 500
-
-    # 2) Create class_sessions row (KEEPING your current schema shape)
-    sess_payload = {
-        "job_id": job_id,
-        "status": "queued",
-        "plan": plan,
-        "file_url": None,
-        "error": None,
-        "started_at": None,
-        "completed_at": None,
-    }
-
-    # If your class_sessions table has user_id, attach it when present.
-    if user_id:
-        sess_payload["user_id"] = user_id
-
-    sess_res = supabase.table("class_sessions").insert(sess_payload).execute()
-
-    sess_err = supa_err(sess_res)
-    if sess_err:
-        # rollback job row if session fails (best-effort)
-        supabase.table("jobs").delete().eq("id", job_id).execute()
-
-        return jsonify({
-            "status": "error",
-            "error": "class_sessions insert failed",
-            "details": sess_err,
+            "status": "queued",
             "job_id": str(job_id),
+            "user_id": user_id,
+        }), 202
+
+    except Exception as e:
+        # ALWAYS JSON on internal errors (no HTML 500 page)
+        return jsonify({
+            "status": "error",
+            "error": "Internal server error",
+            "details": str(e),
         }), 500
 
-    # Return user_id for debugging (null for anon)
-    return jsonify({
-        "status": "queued",
-        "job_id": str(job_id),
-        "user_id": user_id,
-    }), 202
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
