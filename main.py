@@ -159,23 +159,14 @@ def generate():
 
         plan = normalize_plan(data)
 
-        # ---- Extract bearer token (optional) ----
+        # ---- Optional user id (no-verify decode is fine for attaching metadata) ----
         user_id = None
         try:
-            auth_header = request.headers.get("Authorization") or ""
-            if auth_header.lower().startswith("bearer "):
-                token = auth_header.split(" ", 1)[1].strip()
-
-                # Use Supabase Auth to validate token and get user id.
-                # If this fails for ANY reason, we just treat as anonymous.
-                try:
-                    user_res = supabase.auth.get_user(token)
-                    # supabase-py response shapes vary; handle both
-                    user_obj = getattr(user_res, "user", None) or getattr(getattr(user_res, "data", None), "user", None)
-                    if user_obj and getattr(user_obj, "id", None):
-                        user_id = user_obj.id
-                except Exception:
-                    user_id = None
+            auth = request.headers.get("Authorization") or ""
+            if auth.lower().startswith("bearer "):
+                token = auth.split(" ", 1)[1].strip()
+                claims = jwt_claims(token)
+                user_id = claims.get("sub")  # Supabase user id
         except Exception:
             user_id = None
 
@@ -205,17 +196,14 @@ def generate():
         if not job_id:
             return jsonify({"status": "error", "error": "Job row missing id"}), 500
 
-     # 2) Create class_sessions row
-    sess_res = (
-        supabase
-        .table("class_sessions")
-        .insert({
+        # ---- 2) Create class_sessions row ----
+        sess_payload = {
             "job_id": job_id,
-            "user_id": user_id,  # <-- keep this line if your main.py already has user_id; if not, delete it
+            "user_id": user_id,
             "status": "queued",
             "plan": plan,
 
-            # denormalized fields (match your real column names)
+            # denormalized columns that exist in your schema
             "difficulty": plan.get("difficulty"),
             "length_min": plan.get("length_min"),
             "pace": plan.get("pace"),
@@ -226,9 +214,7 @@ def generate():
             "started_at": None,
             "completed_at": None,
             "storage_path": None,
-        })
-        .execute()
-    )
+        }
 
         sess_res = supabase.table("class_sessions").insert(sess_payload).execute()
         sess_err = supa_err(sess_res)
@@ -253,13 +239,11 @@ def generate():
         }), 202
 
     except Exception as e:
-        # ALWAYS JSON on internal errors (no HTML 500 page)
         return jsonify({
             "status": "error",
             "error": "Internal server error",
             "details": str(e),
         }), 500
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
