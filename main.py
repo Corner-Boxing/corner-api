@@ -13,6 +13,7 @@ CORS(
     app,
     resources={r"/*": {"origins": "*"}},
     allow_headers=["Content-Type", "Authorization"],
+    methods=["GET", "POST", "OPTIONS"],
 )
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -128,6 +129,16 @@ def whoami():
         }
     })
 
+def get_user_id_from_request():
+    auth = request.headers.get("Authorization") or ""
+    if not auth.lower().startswith("bearer "):
+        return None
+
+    token = auth.split(" ", 1)[1].strip()
+    claims = jwt_claims(token)  # your existing helper (no verify, ok for reading sub)
+    # Supabase user id is usually in "sub"
+    return claims.get("sub")
+
 @app.route("/generate", methods=["POST"])
 def generate():
     try:
@@ -136,6 +147,9 @@ def generate():
         return jsonify({"status": "error", "error": "Invalid JSON"}), 400
 
     plan = normalize_plan(data)
+
+    user_id = get_user_id_from_request()
+    print(f"[generate] auth_header_present={bool(request.headers.get('Authorization'))} user_id={user_id}")
 
     # optional (logged-in) user association
     user_id = get_user_id_from_request()
