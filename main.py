@@ -135,13 +135,33 @@ def get_plan_tier(user_id: str):
     except Exception:
         return "free"
 
-def get_user_id_from_request_noverify() -> str | None:
-    auth = request.headers.get("Authorization") or ""
-    if not auth.lower().startswith("bearer "):
+def get_verified_user_id_from_request() -> str | None:
+    """
+    Verify token with Supabase Auth and return user id.
+    If it fails, return None.
+    """
+    token = get_bearer_token()
+    if not token:
         return None
-    token = auth.split(" ", 1)[1].strip()
-    claims = jwt_claims(token)  # your existing no-verify decoder
-    return claims.get("sub")
+
+    try:
+        user_res = supabase.auth.get_user(token)
+
+        user_obj = getattr(user_res, "user", None)
+        if not user_obj and hasattr(user_res, "data"):
+            user_obj = getattr(user_res.data, "user", None)
+
+        if user_obj and getattr(user_obj, "id", None):
+            return user_obj.id
+
+        if isinstance(user_res, dict):
+            u = user_res.get("user")
+            if isinstance(u, dict):
+                return u.get("id")
+
+        return None
+    except Exception:
+        return None
 
 
 @app.route("/")
@@ -164,7 +184,7 @@ def whoami():
 
 @app.route("/me", methods=["GET"])
 def me():
-    uid = get_user_id_from_request_noverify()
+    uid = get_verified_user_id_from_request()
     if not uid:
         return jsonify({"signed_in": False}), 200
 
@@ -177,7 +197,7 @@ def me():
     )
 
     row = prof.data[0] if prof.data else None
-    plan_tier = (row.get("plan_tier") if row else None) or "free"
+    plan_tier = ((row.get("plan_tier") if row else None) or "free").strip().lower()
 
     return jsonify({
         "signed_in": True,
@@ -185,6 +205,7 @@ def me():
         "plan_tier": plan_tier,
         "profile": row,
     }), 200
+
 
 @app.route("/generate", methods=["POST"])
 def generate():
