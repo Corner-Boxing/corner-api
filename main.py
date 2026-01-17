@@ -135,6 +135,14 @@ def get_plan_tier(user_id: str):
     except Exception:
         return "free"
 
+def get_user_id_from_request_noverify() -> str | None:
+    auth = request.headers.get("Authorization") or ""
+    if not auth.lower().startswith("bearer "):
+        return None
+    token = auth.split(" ", 1)[1].strip()
+    claims = jwt_claims(token)  # your existing no-verify decoder
+    return claims.get("sub")
+
 
 @app.route("/")
 def home():
@@ -154,6 +162,29 @@ def whoami():
         }
     })
 
+@app.route("/me", methods=["GET"])
+def me():
+    uid = get_user_id_from_request_noverify()
+    if not uid:
+        return jsonify({"signed_in": False}), 200
+
+    prof = (
+        supabase.table("profiles")
+        .select("id,username,display_name,tier")
+        .eq("id", uid)
+        .limit(1)
+        .execute()
+    )
+
+    row = prof.data[0] if prof.data else None
+    tier = (row.get("tier") if row else None) or "free"
+
+    return jsonify({
+        "signed_in": True,
+        "user_id": uid,
+        "tier": tier,
+        "profile": row,
+    }), 200
 
 @app.route("/generate", methods=["POST"])
 def generate():
