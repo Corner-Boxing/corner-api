@@ -170,19 +170,19 @@ def me():
 
     prof = (
         supabase.table("profiles")
-        .select("id,username,display_name,tier")
+        .select("id,username,display_name,plan_tier")
         .eq("id", uid)
         .limit(1)
         .execute()
     )
 
     row = prof.data[0] if prof.data else None
-    tier = (row.get("tier") if row else None) or "free"
+    plan_tier = (row.get("plan_tier") if row else None) or "free"
 
     return jsonify({
         "signed_in": True,
         "user_id": uid,
-        "tier": tier,
+        "plan_tier": plan_tier,
         "profile": row,
     }), 200
 
