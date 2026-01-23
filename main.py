@@ -88,38 +88,6 @@ def get_bearer_token():
     token = auth.split(" ", 1)[1].strip()
     return token or None
 
-
-def get_verified_user_id():
-    """
-    IMPORTANT: Verify token with Supabase Auth (don’t trust decode-only for tier decisions).
-    If it fails, treat as guest.
-    """
-    token = get_bearer_token()
-    if not token:
-        return None
-
-    try:
-        user_res = supabase.auth.get_user(token)
-
-        # handle common shapes
-        user_obj = getattr(user_res, "user", None)
-        if not user_obj and hasattr(user_res, "data"):
-            user_obj = getattr(user_res.data, "user", None)
-
-        if user_obj and getattr(user_obj, "id", None):
-            return user_obj.id
-
-        # sometimes dict-like
-        if isinstance(user_res, dict):
-            u = user_res.get("user")
-            if isinstance(u, dict):
-                return u.get("id")
-
-        return None
-    except Exception:
-        return None
-
-
 def get_plan_tier(user_id: str):
     """
     Read profiles.plan_tier for the user.
@@ -222,7 +190,7 @@ def generate():
         requested_plan = normalize_plan(data)
 
         # 1) Verify user (or guest)
-        user_id = get_verified_user_id()
+        user_id = get_verified_user_id_from_request()
 
         # 2) Determine tier
         #    - Guest => demo
