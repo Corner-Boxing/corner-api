@@ -105,14 +105,11 @@ def get_plan_tier(user_id: str):
 
 def get_active_job_for_user(user_id: str):
     """
-    Returns the oldest active job id for this signed-in user, or None.
+    Returns one active job id for this signed-in user, or None.
     Active means one of:
       - queued
       - pending
       - processing
-
-    We use class_sessions.user_id to find the user's session rows,
-    then return the linked job_id.
     """
     if not user_id:
         return None
@@ -120,10 +117,9 @@ def get_active_job_for_user(user_id: str):
     try:
         res = (
             supabase.table("class_sessions")
-            .select("job_id,status,created_at")
+            .select("job_id,status")
             .eq("user_id", user_id)
             .in_("status", ["queued", "pending", "processing"])
-            .order("created_at", desc=False)
             .limit(1)
             .execute()
         )
