@@ -1,4 +1,5 @@
 import os
+import time
 import base64
 import json
 from flask import Flask, request, jsonify
@@ -30,6 +31,8 @@ DEMO_DIFFICULTY = "intermediate"   # locked
 DEMO_LENGTH_MIN = 20              # locked
 DEMO_MUSIC = "demo"               # locked (we'll add audio later; for now it's just a label)
 DEMO_PACE = "Normal"              # keep simple + consistent
+GUEST_GENERATE_COOLDOWN_SECONDS = 15
+_guest_last_generate_by_ip = {}
 
 
 def normalize_plan(payload: dict):
@@ -87,6 +90,12 @@ def get_bearer_token():
         return None
     token = auth.split(" ", 1)[1].strip()
     return token or None
+
+def get_client_ip():
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return (request.remote_addr or "").strip() or "unknown"
 
 def get_plan_tier(user_id: str):
     """
@@ -220,6 +229,19 @@ def generate():
         # 1) Verify user (or guest)
         user_id = get_verified_user_id_from_request()
 
+        client_ip = get_client_ip()
+
+        if not user_id:
+            now = time.time()
+            last_at = _guest_last_generate_by_ip.get(client_ip, 0)
+            if now - last_at < GUEST_GENERATE_COOLDOWN_SECONDS:
+                remaining = int(GUEST_GENERATE_COOLDOWN_SECONDS - (now - last_at))
+                return jsonify({
+                    "status": "rate_limited",
+                    "error": "Please wait a moment before generating again.",
+                    "retry_after_seconds": max(1, remaining),
+                }), 429
+
         # 2) Determine tier
         #    - Guest => demo
         #    - Logged in, not pro => demo
@@ -316,6 +338,9 @@ def generate():
                 "details": sess_err,
                 "job_id": str(job_id),
             }), 500
+
+        if not user_id:
+            _guest_last_generate_by_ip[client_ip] = time.time()
 
         return jsonify({
             "status": "queued",
