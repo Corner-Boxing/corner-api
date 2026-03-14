@@ -103,6 +103,38 @@ def get_plan_tier(user_id: str):
     except Exception:
         return "free"
 
+def get_active_job_for_user(user_id: str):
+    """
+    Returns the oldest active job id for this signed-in user, or None.
+    Active means one of:
+      - queued
+      - pending
+      - processing
+
+    We use class_sessions.user_id to find the user's session rows,
+    then return the linked job_id.
+    """
+    if not user_id:
+        return None
+
+    try:
+        res = (
+            supabase.table("class_sessions")
+            .select("job_id,status,created_at")
+            .eq("user_id", user_id)
+            .in_("status", ["queued", "pending", "processing"])
+            .order("created_at", desc=False)
+            .limit(1)
+            .execute()
+        )
+
+        if res.data and isinstance(res.data[0], dict):
+            return res.data[0].get("job_id")
+
+        return None
+    except Exception:
+        return None
+
 def get_verified_user_id_from_request() -> str | None:
     """
     Verify token with Supabase Auth and return user id.
@@ -198,6 +230,16 @@ def generate():
         #    - Pro => full
         plan_tier = get_plan_tier(user_id) if user_id else "free"
         is_pro = (plan_tier == "pro")
+
+        # 2.5) Signed-in users may only have one active job at a time
+        if user_id:
+            active_job_id = get_active_job_for_user(user_id)
+            if active_job_id:
+                return jsonify({
+                    "status": "conflict",
+                    "error": "You already have a class generating.",
+                    "active_job_id": str(active_job_id),
+                }), 409
 
         class_mode = "full" if is_pro else "demo"
 
