@@ -579,6 +579,62 @@ def load_following_ids(user_id: str):
     except Exception:
         return set()
 
+def load_follower_ids(user_id: str):
+    try:
+        res = (
+            supabase.table("follows")
+            .select("follower_id")
+            .eq("following_id", user_id)
+            .execute()
+        )
+        return {str(row.get("follower_id")) for row in (res.data or []) if row.get("follower_id")}
+    except Exception:
+        return set()
+
+
+def count_followers(user_id: str):
+    try:
+        res = (
+            supabase.table("follows")
+            .select("follower_id")
+            .eq("following_id", user_id)
+            .execute()
+        )
+        return len(res.data or [])
+    except Exception:
+        return 0
+
+
+def count_following(user_id: str):
+    try:
+        res = (
+            supabase.table("follows")
+            .select("following_id")
+            .eq("follower_id", user_id)
+            .execute()
+        )
+        return len(res.data or [])
+    except Exception:
+        return 0
+
+
+def profile_payload(profile: dict | None, viewer_id: str | None = None):
+    clean = normalize_profile(profile)
+
+    profile_id = str(clean.get("id") or "")
+    following = False
+    is_self = bool(viewer_id and profile_id and viewer_id == profile_id)
+
+    if viewer_id and profile_id and not is_self:
+        following = profile_id in load_following_ids(viewer_id)
+
+    clean["is_self"] = is_self
+    clean["following"] = following
+    clean["followers_count"] = count_followers(profile_id) if profile_id else 0
+    clean["following_count"] = count_following(profile_id) if profile_id else 0
+
+    return clean
+
 
 def safe_session_post(row: dict, profiles_by_id: dict):
     author_id = str(row.get("user_id") or "")
@@ -849,9 +905,199 @@ def follow_user(target_user_id):
         }), 500
 
 
+@app.route("/search/users", methods=["GET"])
+def search_users():
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    q = str(request.args.get("q") or "").strip().lower()
+
+    try:
+        following_ids = load_following_ids(uid)
+
+        res = (
+            supabase.table("profiles")
+            .select("id,username,display_name,bio,avatar_url")
+            .limit(100)
+            .execute()
+        )
+
+        matches = []
+
+        for row in (res.data or []):
+            profile_id = str(row.get("id") or "")
+            if not profile_id or profile_id == uid:
+                continue
+
+            username = str(row.get("username") or "").lower()
+            display_name = str(row.get("display_name") or "").lower()
+            bio = str(row.get("bio") or "").lower()
+
+            if q:
+                haystack = f"{username} {display_name} {bio}"
+                if q not in haystack:
+                    continue
+
+            profile = normalize_profile(row)
+            profile["following"] = profile_id in following_ids
+            profile["is_self"] = False
+
+            matches.append({
+                "profile": profile,
+                "reason": "Search result" if q else "Corner athlete",
+                "already_following": profile_id in following_ids,
+            })
+
+            if len(matches) >= 25:
+                break
+
+        return jsonify({
+            "status": "ok",
+            "items": matches,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not search users.",
+            "details": str(e),
+        }), 500
+
+
+@app.route("/profile/by-username/<username>", methods=["GET"])
+def read_profile_by_username(username):
+    viewer_id = get_verified_user_id_from_request()
+    username = clean_username(username)
+
+    if not username:
+        return jsonify({
+            "status": "error",
+            "error": "Missing username.",
+        }), 400
+
+    try:
+        res = (
+            supabase.table("profiles")
+            .select("id,username,display_name,bio,avatar_url,created_at,plan_tier")
+            .eq("username", username)
+            .limit(1)
+            .execute()
+        )
+
+        if not res.data:
+            return jsonify({
+                "status": "error",
+                "error": "Profile not found.",
+            }), 404
+
+        return jsonify({
+            "status": "ok",
+            "profile": profile_payload(res.data[0], viewer_id),
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not load profile.",
+            "details": str(e),
+        }), 500
+
+
+@app.route("/profile/<profile_id>/following", methods=["GET"])
+def profile_following(profile_id):
+    viewer_id = get_verified_user_id_from_request()
+    profile_id = str(profile_id or "").strip()
+
+    try:
+        res = (
+            supabase.table("follows")
+            .select("following_id,created_at")
+            .eq("follower_id", profile_id)
+            .execute()
+        )
+
+        ids = [str(row.get("following_id")) for row in (res.data or []) if row.get("following_id")]
+        profiles_by_id = load_profiles_map(ids)
+
+        items = []
+        viewer_following_ids = load_following_ids(viewer_id) if viewer_id else set()
+
+        for target_id in ids:
+            profile = profiles_by_id.get(target_id)
+            if not profile:
+                continue
+
+            profile["following"] = target_id in viewer_following_ids
+            profile["is_self"] = bool(viewer_id and viewer_id == target_id)
+
+            items.append({
+                "profile": profile,
+                "already_following": profile["following"],
+                "reason": "Following",
+            })
+
+        return jsonify({
+            "status": "ok",
+            "items": items,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not load following.",
+            "details": str(e),
+        }), 500
+
+
+@app.route("/profile/<profile_id>/followers", methods=["GET"])
+def profile_followers(profile_id):
+    viewer_id = get_verified_user_id_from_request()
+    profile_id = str(profile_id or "").strip()
+
+    try:
+        res = (
+            supabase.table("follows")
+            .select("follower_id,created_at")
+            .eq("following_id", profile_id)
+            .execute()
+        )
+
+        ids = [str(row.get("follower_id")) for row in (res.data or []) if row.get("follower_id")]
+        profiles_by_id = load_profiles_map(ids)
+
+        items = []
+        viewer_following_ids = load_following_ids(viewer_id) if viewer_id else set()
+
+        for follower_id in ids:
+            profile = profiles_by_id.get(follower_id)
+            if not profile:
+                continue
+
+            profile["following"] = follower_id in viewer_following_ids
+            profile["is_self"] = bool(viewer_id and viewer_id == follower_id)
+
+            items.append({
+                "profile": profile,
+                "already_following": profile["following"],
+                "reason": "Follower",
+            })
+
+        return jsonify({
+            "status": "ok",
+            "items": items,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not load followers.",
+            "details": str(e),
+        }), 500
+
 @app.route("/profile/<profile_id>", methods=["GET"])
 def read_profile(profile_id):
-    uid = get_verified_user_id_from_request()
+    viewer_id = get_verified_user_id_from_request()
     profile_id = str(profile_id or "").strip()
 
     try:
@@ -869,16 +1115,9 @@ def read_profile(profile_id):
                 "error": "Profile not found.",
             }), 404
 
-        following = False
-        if uid and uid != profile_id:
-            following_ids = load_following_ids(uid)
-            following = profile_id in following_ids
-
         return jsonify({
             "status": "ok",
-            "profile": normalize_profile(res.data[0]),
-            "following": following,
-            "is_self": bool(uid and uid == profile_id),
+            "profile": profile_payload(res.data[0], viewer_id),
         }), 200
 
     except Exception as e:
