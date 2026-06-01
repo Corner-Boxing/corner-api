@@ -593,28 +593,36 @@ def home_suggestions():
             supabase.table("profiles")
             .select("id,username,display_name,bio,avatar_url")
             .neq("id", uid)
-            .limit(40)
+            .limit(60)
             .execute()
         )
 
-        suggestions = []
+        following_items = []
+        suggestion_items = []
+
         for row in (res.data or []):
             profile_id = str(row.get("id") or "")
-            if not profile_id or profile_id in following_ids:
+            if not profile_id:
                 continue
 
-            suggestions.append({
-                "profile": normalize_profile(row),
-                "reason": "Corner athlete",
-                "already_following": False,
-            })
+            already_following = profile_id in following_ids
 
-            if len(suggestions) >= 12:
-                break
+            item = {
+                "profile": normalize_profile(row),
+                "reason": "Following" if already_following else "Corner athlete",
+                "already_following": already_following,
+            }
+
+            if already_following:
+                following_items.append(item)
+            else:
+                suggestion_items.append(item)
+
+        items = following_items[:12] + suggestion_items[:12]
 
         return jsonify({
             "status": "ok",
-            "items": suggestions,
+            "items": items[:18],
         }), 200
 
     except Exception as e:
