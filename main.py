@@ -358,5 +358,370 @@ def generate():
         }), 500
 
 
+# -------------------------------------------------
+# Home / Social API
+# -------------------------------------------------
+
+def require_user_id():
+    uid = get_verified_user_id_from_request()
+    if not uid:
+        return None, (jsonify({
+            "status": "error",
+            "error": "Unauthorized",
+        }), 401)
+    return uid, None
+
+
+def profile_display_name(profile: dict | None, fallback: str = "Corner athlete"):
+    if not profile:
+      return fallback
+
+    display_name = (profile.get("display_name") or "").strip()
+    username = (profile.get("username") or "").strip()
+
+    if display_name:
+        return display_name
+    if username:
+        return username
+    return fallback
+
+
+def normalize_profile(row: dict | None):
+    row = row or {}
+    username = (row.get("username") or "").strip()
+    display_name = (row.get("display_name") or "").strip()
+
+    return {
+        "id": row.get("id"),
+        "username": username,
+        "display_name": display_name or username or "Corner athlete",
+        "bio": row.get("bio") or "",
+        "avatar_url": row.get("avatar_url") or "assets/avatars/default-avatar-head.png",
+    }
+
+
+def load_profiles_map(user_ids: list[str]):
+    clean_ids = [str(x) for x in set(user_ids or []) if x]
+    if not clean_ids:
+        return {}
+
+    try:
+        res = (
+            supabase.table("profiles")
+            .select("id,username,display_name,bio,avatar_url")
+            .in_("id", clean_ids)
+            .execute()
+        )
+        return {str(row.get("id")): normalize_profile(row) for row in (res.data or []) if row.get("id")}
+    except Exception:
+        return {}
+
+
+def load_following_ids(user_id: str):
+    try:
+        res = (
+            supabase.table("follows")
+            .select("following_id")
+            .eq("follower_id", user_id)
+            .execute()
+        )
+        return {str(row.get("following_id")) for row in (res.data or []) if row.get("following_id")}
+    except Exception:
+        return set()
+
+
+def safe_session_post(row: dict, profiles_by_id: dict):
+    author_id = str(row.get("user_id") or "")
+    profile = profiles_by_id.get(author_id) or normalize_profile({"id": author_id})
+
+    visibility = (row.get("visibility") or row.get("privacy") or "public")
+    class_mode = row.get("class_mode") or "class"
+    difficulty = row.get("difficulty") or ""
+    length_min = row.get("length_min") or row.get("length") or ""
+    music = row.get("music") or ""
+    created_at = row.get("created_at")
+
+    title = row.get("title") or "Completed a Corner class."
+    body = row.get("body") or row.get("caption") or "Finished a verified boxing session."
+
+    tags = []
+    if class_mode:
+        tags.append(str(class_mode).replace("_", " ").title())
+    if difficulty:
+        tags.append(str(difficulty).title())
+    if length_min:
+        tags.append(f"{length_min} min")
+    if visibility:
+        tags.append(str(visibility).replace("_", "-"))
+
+    return {
+        "id": row.get("id"),
+        "type": "session_post",
+        "author": profile,
+        "title": title,
+        "body": body,
+        "created_at": created_at,
+        "tags": tags[:4],
+        "visibility": visibility,
+        "class_session_id": row.get("class_session_id"),
+        "job_id": row.get("job_id"),
+        "music": music,
+    }
+
+
+@app.route("/home/feed", methods=["GET"])
+def home_feed():
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    try:
+        following_ids = load_following_ids(uid)
+        allowed_user_ids = set(following_ids)
+        allowed_user_ids.add(uid)
+
+        posts_res = (
+            supabase.table("session_posts")
+            .select("*")
+            .order("created_at", desc=True)
+            .limit(60)
+            .execute()
+        )
+
+        raw_posts = posts_res.data or []
+
+        visible_posts = []
+        author_ids = []
+
+        for row in raw_posts:
+            author_id = str(row.get("user_id") or "")
+            visibility = str(row.get("visibility") or row.get("privacy") or "public").lower()
+
+            can_see = False
+
+            if author_id == uid:
+                can_see = True
+            elif visibility == "public":
+                can_see = True
+            elif visibility in ("friends", "friends_only", "followers", "followers_only") and author_id in allowed_user_ids:
+                can_see = True
+
+            if can_see:
+                visible_posts.append(row)
+                if author_id:
+                    author_ids.append(author_id)
+
+            if len(visible_posts) >= 30:
+                break
+
+        profiles_by_id = load_profiles_map(author_ids)
+
+        return jsonify({
+            "status": "ok",
+            "items": [safe_session_post(row, profiles_by_id) for row in visible_posts],
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not load home feed.",
+            "details": str(e),
+        }), 500
+
+
+@app.route("/home/notifications", methods=["GET"])
+def home_notifications():
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    try:
+        res = (
+            supabase.table("notifications")
+            .select("*")
+            .eq("user_id", uid)
+            .order("created_at", desc=True)
+            .limit(40)
+            .execute()
+        )
+
+        rows = res.data or []
+
+        actor_ids = [str(row.get("actor_id")) for row in rows if row.get("actor_id")]
+        profiles_by_id = load_profiles_map(actor_ids)
+
+        items = []
+        for row in rows:
+            actor_id = str(row.get("actor_id") or "")
+            actor = profiles_by_id.get(actor_id)
+
+            items.append({
+                "id": row.get("id"),
+                "type": row.get("type") or "notification",
+                "title": row.get("title") or "Notification",
+                "body": row.get("body") or row.get("message") or "",
+                "read": bool(row.get("read") or row.get("is_read") or False),
+                "created_at": row.get("created_at"),
+                "actor": actor,
+                "entity_type": row.get("entity_type"),
+                "entity_id": row.get("entity_id"),
+            })
+
+        return jsonify({
+            "status": "ok",
+            "items": items,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not load notifications.",
+            "details": str(e),
+        }), 500
+
+
+@app.route("/home/suggestions", methods=["GET"])
+def home_suggestions():
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    try:
+        following_ids = load_following_ids(uid)
+
+        res = (
+            supabase.table("profiles")
+            .select("id,username,display_name,bio,avatar_url")
+            .neq("id", uid)
+            .limit(40)
+            .execute()
+        )
+
+        suggestions = []
+        for row in (res.data or []):
+            profile_id = str(row.get("id") or "")
+            if not profile_id or profile_id in following_ids:
+                continue
+
+            suggestions.append({
+                "profile": normalize_profile(row),
+                "reason": "Corner athlete",
+                "already_following": False,
+            })
+
+            if len(suggestions) >= 12:
+                break
+
+        return jsonify({
+            "status": "ok",
+            "items": suggestions,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not load suggestions.",
+            "details": str(e),
+        }), 500
+
+
+@app.route("/follow/<target_user_id>", methods=["POST", "DELETE"])
+def follow_user(target_user_id):
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    target_user_id = str(target_user_id or "").strip()
+
+    if not target_user_id:
+        return jsonify({
+            "status": "error",
+            "error": "Missing target user id.",
+        }), 400
+
+    if target_user_id == uid:
+        return jsonify({
+            "status": "error",
+            "error": "You cannot follow yourself.",
+        }), 400
+
+    try:
+        if request.method == "DELETE":
+            supabase.table("follows").delete().eq("follower_id", uid).eq("following_id", target_user_id).execute()
+            return jsonify({
+                "status": "ok",
+                "following": False,
+                "target_user_id": target_user_id,
+            }), 200
+
+        existing = (
+            supabase.table("follows")
+            .select("id")
+            .eq("follower_id", uid)
+            .eq("following_id", target_user_id)
+            .limit(1)
+            .execute()
+        )
+
+        if not existing.data:
+            supabase.table("follows").insert({
+                "follower_id": uid,
+                "following_id": target_user_id,
+            }).execute()
+
+        return jsonify({
+            "status": "ok",
+            "following": True,
+            "target_user_id": target_user_id,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not update follow state.",
+            "details": str(e),
+        }), 500
+
+
+@app.route("/profile/<profile_id>", methods=["GET"])
+def read_profile(profile_id):
+    uid = get_verified_user_id_from_request()
+    profile_id = str(profile_id or "").strip()
+
+    try:
+        res = (
+            supabase.table("profiles")
+            .select("id,username,display_name,bio,avatar_url,created_at,plan_tier")
+            .eq("id", profile_id)
+            .limit(1)
+            .execute()
+        )
+
+        if not res.data:
+            return jsonify({
+                "status": "error",
+                "error": "Profile not found.",
+            }), 404
+
+        following = False
+        if uid and uid != profile_id:
+            following_ids = load_following_ids(uid)
+            following = profile_id in following_ids
+
+        return jsonify({
+            "status": "ok",
+            "profile": normalize_profile(res.data[0]),
+            "following": following,
+            "is_self": bool(uid and uid == profile_id),
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not load profile.",
+            "details": str(e),
+        }), 500
+
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
