@@ -12,7 +12,7 @@ CORS(
     app,
     resources={r"/*": {"origins": "*"}},
     allow_headers=["Content-Type", "Authorization"],
-    methods=["GET", "POST", "OPTIONS"],
+    methods=["GET", "POST", "DELETE", "OPTIONS"],
 )
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
