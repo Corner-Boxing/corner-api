@@ -2,6 +2,8 @@ import os
 import time
 import base64
 import json
+import re
+from datetime import datetime, timezone
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client, Client
@@ -12,7 +14,7 @@ CORS(
     app,
     resources={r"/*": {"origins": "*"}},
     allow_headers=["Content-Type", "Authorization"],
-    methods=["GET", "POST", "DELETE", "OPTIONS"],
+    methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
 )
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -69,6 +71,72 @@ def supa_err(resp):
         return None
     msg = getattr(err, "message", None) or getattr(err, "msg", None)
     return msg or str(err)
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def clean_username(value: str | None):
+    raw = str(value or "").strip().lower()
+    raw = raw.replace(" ", "_")
+    raw = re.sub(r"[^a-z0-9_]", "", raw)
+    raw = re.sub(r"_+", "_", raw).strip("_")
+    return raw
+
+
+def username_is_valid(username: str):
+    if not username:
+        return False
+    if len(username) < 3 or len(username) > 24:
+        return False
+    return bool(re.fullmatch(r"[a-z0-9_]+", username))
+
+
+def profile_is_complete(profile: dict | None):
+    if not profile:
+        return False
+    return bool((profile.get("username") or "").strip() and (profile.get("display_name") or "").strip())
+
+
+def ensure_profile_row(user_id: str):
+    if not user_id:
+        return None
+
+    res = (
+        supabase.table("profiles")
+        .select("id,username,display_name,bio,avatar_url,plan_tier,subscription_status,tier_updated_at,created_at,updated_at")
+        .eq("id", user_id)
+        .limit(1)
+        .execute()
+    )
+
+    if res.data:
+        return res.data[0]
+
+    payload = {
+        "id": user_id,
+        "username": None,
+        "display_name": None,
+        "bio": "",
+        "avatar_url": "assets/avatars/default-avatar-head.png",
+        "plan_tier": "free",
+        "created_at": utc_now_iso(),
+        "updated_at": utc_now_iso(),
+    }
+
+    insert_res = supabase.table("profiles").insert(payload).execute()
+    if insert_res.data:
+        return insert_res.data[0]
+
+    # Race-condition fallback: if another request created it first, read again.
+    retry = (
+        supabase.table("profiles")
+        .select("id,username,display_name,bio,avatar_url,plan_tier,subscription_status,tier_updated_at,created_at,updated_at")
+        .eq("id", user_id)
+        .limit(1)
+        .execute()
+    )
+    return retry.data[0] if retry.data else None
 
 
 def jwt_claims_no_verify(jwt: str):
@@ -193,24 +261,106 @@ def me():
     if not uid:
         return jsonify({"signed_in": False}), 200
 
-    prof = (
-        supabase.table("profiles")
-        .select("id,username,display_name,plan_tier")
-        .eq("id", uid)
-        .limit(1)
-        .execute()
-    )
-
-    row = prof.data[0] if prof.data else None
+    row = ensure_profile_row(uid)
     plan_tier = ((row.get("plan_tier") if row else None) or "free").strip().lower()
 
     return jsonify({
         "signed_in": True,
         "user_id": uid,
         "plan_tier": plan_tier,
-        "profile": row,
+        "profile": normalize_profile(row),
+        "profile_complete": profile_is_complete(row),
     }), 200
 
+@app.route("/me/profile", methods=["PATCH"])
+def update_my_profile():
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    data = request.get_json(force=True, silent=True) or {}
+
+    display_name = str(data.get("display_name") or "").strip()
+    username = clean_username(data.get("username"))
+    bio = str(data.get("bio") or "").strip()
+    avatar_url = str(data.get("avatar_url") or "").strip()
+
+    if not display_name or len(display_name) > 40:
+        return jsonify({
+            "status": "error",
+            "error": "Display name must be 1-40 characters.",
+        }), 400
+
+    if not username_is_valid(username):
+        return jsonify({
+            "status": "error",
+            "error": "Username must be 3-24 characters and use only letters, numbers, or underscores.",
+        }), 400
+
+    if len(bio) > 160:
+        return jsonify({
+            "status": "error",
+            "error": "Bio must be 160 characters or less.",
+        }), 400
+
+    if avatar_url:
+        allowed_avatar = (
+            avatar_url.startswith("assets/avatars/")
+            or avatar_url.startswith("https://")
+            or avatar_url.startswith("http://")
+        )
+        if not allowed_avatar or len(avatar_url) > 500:
+            return jsonify({
+                "status": "error",
+                "error": "Avatar URL is not allowed.",
+            }), 400
+    else:
+        avatar_url = "assets/avatars/default-avatar-head.png"
+
+    existing_username = (
+        supabase.table("profiles")
+        .select("id,username")
+        .eq("username", username)
+        .limit(1)
+        .execute()
+    )
+
+    if existing_username.data:
+        owner_id = str(existing_username.data[0].get("id") or "")
+        if owner_id and owner_id != uid:
+            return jsonify({
+                "status": "error",
+                "error": "That username is already taken.",
+            }), 409
+
+    ensure_profile_row(uid)
+
+    payload = {
+        "id": uid,
+        "username": username,
+        "display_name": display_name,
+        "bio": bio,
+        "avatar_url": avatar_url,
+        "updated_at": utc_now_iso(),
+    }
+
+    res = supabase.table("profiles").upsert(payload).execute()
+    err_msg = supa_err(res)
+
+    if err_msg:
+        return jsonify({
+            "status": "error",
+            "error": "Profile update failed.",
+            "details": err_msg,
+        }), 500
+
+    saved = ensure_profile_row(uid)
+
+    return jsonify({
+        "status": "ok",
+        "profile": normalize_profile(saved),
+        "profile_complete": profile_is_complete(saved),
+    }), 200
 
 @app.route("/generate", methods=["POST"])
 def generate():
