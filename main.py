@@ -656,7 +656,7 @@ def follow_user(target_user_id):
 
         existing = (
             supabase.table("follows")
-            .select("id")
+            .select("follower_id,following_id")
             .eq("follower_id", uid)
             .eq("following_id", target_user_id)
             .limit(1)
@@ -664,10 +664,18 @@ def follow_user(target_user_id):
         )
 
         if not existing.data:
-            supabase.table("follows").insert({
+            insert_res = supabase.table("follows").insert({
                 "follower_id": uid,
                 "following_id": target_user_id,
             }).execute()
+
+            insert_err = supa_err(insert_res)
+            if insert_err:
+                return jsonify({
+                    "status": "error",
+                    "error": "Follow insert failed.",
+                    "details": insert_err,
+                }), 500
 
         return jsonify({
             "status": "ok",
