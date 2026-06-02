@@ -268,7 +268,7 @@ def me():
         "signed_in": True,
         "user_id": uid,
         "plan_tier": plan_tier,
-        "profile": normalize_profile(row),
+        "profile": profile_payload(row, uid),
         "profile_complete": profile_is_complete(row),
     }), 200
 
@@ -675,6 +675,198 @@ def safe_session_post(row: dict, profiles_by_id: dict):
     }
 
 
+def safe_int(value, fallback=0):
+    try:
+        if value is None:
+            return fallback
+        return int(float(value))
+    except Exception:
+        return fallback
+
+
+def compute_listen_required_seconds(session_row: dict, audio_duration_seconds: int | None = None):
+    existing = safe_int(session_row.get("listen_required_seconds"), 0)
+    if existing > 0:
+        return existing
+
+    if audio_duration_seconds and audio_duration_seconds > 0:
+        return max(30, int(audio_duration_seconds * 0.85))
+
+    length_min = safe_int(session_row.get("length_min"), 0)
+    if length_min > 0:
+        return max(30, int(length_min * 60 * 0.85))
+
+    return 60
+
+
+def create_session_post_for_completed_session(session_row: dict):
+    user_id = session_row.get("user_id")
+    session_id = session_row.get("id")
+    job_id = session_row.get("job_id")
+
+    if not user_id or not session_id:
+        return None
+
+    existing = (
+        supabase.table("session_posts")
+        .select("id")
+        .eq("class_session_id", session_id)
+        .limit(1)
+        .execute()
+    )
+
+    if existing.data:
+        return existing.data[0]
+
+    difficulty = session_row.get("difficulty") or ""
+    length_min = session_row.get("length_min") or ""
+    class_mode = session_row.get("class_mode") or "full"
+    music = session_row.get("music") or ""
+
+    title = "Completed a verified Corner class."
+    body_bits = []
+
+    if length_min:
+        body_bits.append(f"{length_min}-minute")
+
+    if difficulty:
+        body_bits.append(str(difficulty).title())
+
+    body_bits.append("Corner Boxing session")
+
+    body = "Finished a verified " + " ".join(body_bits) + "."
+
+    visibility = "public" if bool(session_row.get("is_public")) else "followers"
+
+    payload = {
+        "user_id": user_id,
+        "class_session_id": session_id,
+        "job_id": job_id,
+        "title": title,
+        "body": body,
+        "visibility": visibility,
+        "class_mode": class_mode,
+        "difficulty": difficulty,
+        "length_min": length_min,
+        "music": music,
+    }
+
+    try:
+        res = supabase.table("session_posts").insert(payload).execute()
+        if res.data:
+            return res.data[0]
+        return None
+    except Exception:
+        # Duplicate race fallback.
+        retry = (
+            supabase.table("session_posts")
+            .select("id")
+            .eq("class_session_id", session_id)
+            .limit(1)
+            .execute()
+        )
+        return retry.data[0] if retry.data else None
+
+
+@app.route("/class-session/<job_id>/listen-heartbeat", methods=["POST"])
+def listen_heartbeat(job_id):
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    job_id = str(job_id or "").strip()
+    data = request.get_json(force=True, silent=True) or {}
+
+    listened_delta_seconds = max(0, min(20, safe_int(data.get("listened_delta_seconds"), 0)))
+    audio_position_seconds = max(0, safe_int(data.get("audio_position_seconds"), 0))
+    audio_duration_seconds = max(0, safe_int(data.get("audio_duration_seconds"), 0))
+
+    if not job_id:
+        return jsonify({
+            "status": "error",
+            "error": "Missing job id.",
+        }), 400
+
+    try:
+        sess_res = (
+            supabase.table("class_sessions")
+            .select("id,job_id,user_id,is_public,class_mode,status,difficulty,length_min,pace,music,listen_required_seconds,listen_progress_seconds,listened_complete,listened_complete_at,storage_path")
+            .eq("job_id", job_id)
+            .limit(1)
+            .execute()
+        )
+
+        if not sess_res.data:
+            return jsonify({
+                "status": "error",
+                "error": "Session not found.",
+            }), 404
+
+        session_row = sess_res.data[0]
+
+        if str(session_row.get("user_id") or "") != uid:
+            return jsonify({
+                "status": "error",
+                "error": "Forbidden.",
+            }), 403
+
+        if str(session_row.get("status") or "").lower() != "done":
+            return jsonify({
+                "status": "ok",
+                "completed": False,
+                "reason": "session_not_done",
+            }), 200
+
+        required_seconds = compute_listen_required_seconds(session_row, audio_duration_seconds)
+        old_progress = safe_int(session_row.get("listen_progress_seconds"), 0)
+        new_progress = max(old_progress, old_progress + listened_delta_seconds)
+
+        already_complete = bool(session_row.get("listened_complete"))
+
+        update_payload = {
+            "listen_required_seconds": required_seconds,
+            "listen_progress_seconds": new_progress,
+            "last_heartbeat_at": utc_now_iso(),
+        }
+
+        completed_now = False
+
+        if not already_complete and new_progress >= required_seconds:
+            completed_now = True
+            update_payload["listened_complete"] = True
+            update_payload["listened_complete_at"] = utc_now_iso()
+
+        supabase.table("class_sessions").update(update_payload).eq("id", session_row.get("id")).execute()
+
+        post = None
+        if already_complete or completed_now:
+            refreshed = (
+                supabase.table("class_sessions")
+                .select("id,job_id,user_id,is_public,class_mode,status,difficulty,length_min,pace,music,listen_required_seconds,listen_progress_seconds,listened_complete,listened_complete_at,storage_path")
+                .eq("id", session_row.get("id"))
+                .limit(1)
+                .execute()
+            )
+            refreshed_row = refreshed.data[0] if refreshed.data else {**session_row, **update_payload}
+            post = create_session_post_for_completed_session(refreshed_row)
+
+        return jsonify({
+            "status": "ok",
+            "completed": bool(already_complete or completed_now),
+            "completed_now": completed_now,
+            "listen_progress_seconds": new_progress,
+            "listen_required_seconds": required_seconds,
+            "audio_position_seconds": audio_position_seconds,
+            "post": post,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not update listening progress.",
+            "details": str(e),
+        }), 500
+
 @app.route("/home/feed", methods=["GET"])
 def home_feed():
     uid, err = require_user_id()
@@ -901,6 +1093,62 @@ def follow_user(target_user_id):
         return jsonify({
             "status": "error",
             "error": "Could not update follow state.",
+            "details": str(e),
+        }), 500
+
+
+@app.route("/profile/<profile_id>/posts", methods=["GET"])
+def profile_posts(profile_id):
+    viewer_id = get_verified_user_id_from_request()
+    profile_id = str(profile_id or "").strip()
+
+    if not profile_id:
+        return jsonify({
+            "status": "error",
+            "error": "Missing profile id.",
+        }), 400
+
+    try:
+        following_ids = load_following_ids(viewer_id) if viewer_id else set()
+        is_self = bool(viewer_id and viewer_id == profile_id)
+
+        posts_res = (
+            supabase.table("session_posts")
+            .select("*")
+            .eq("user_id", profile_id)
+            .order("created_at", desc=True)
+            .limit(40)
+            .execute()
+        )
+
+        visible = []
+
+        for row in (posts_res.data or []):
+            visibility = str(row.get("visibility") or row.get("privacy") or "public").lower()
+
+            can_see = False
+
+            if is_self:
+                can_see = True
+            elif visibility == "public":
+                can_see = True
+            elif visibility in ("friends", "friends_only", "followers", "followers_only") and profile_id in following_ids:
+                can_see = True
+
+            if can_see:
+                visible.append(row)
+
+        profiles_by_id = load_profiles_map([profile_id])
+
+        return jsonify({
+            "status": "ok",
+            "items": [safe_session_post(row, profiles_by_id) for row in visible],
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not load profile posts.",
             "details": str(e),
         }), 500
 
