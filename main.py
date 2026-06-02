@@ -636,19 +636,68 @@ def profile_payload(profile: dict | None, viewer_id: str | None = None):
     return clean
 
 
-def safe_session_post(row: dict, profiles_by_id: dict):
+def count_post_likes(post_id: str):
+    if not post_id:
+        return 0
+    try:
+        res = supabase.table("post_likes").select("post_id").eq("post_id", post_id).execute()
+        return len(res.data or [])
+    except Exception:
+        return 0
+
+
+def count_post_comments(post_id: str):
+    if not post_id:
+        return 0
+    try:
+        res = supabase.table("post_comments").select("id").eq("post_id", post_id).execute()
+        return len(res.data or [])
+    except Exception:
+        return 0
+
+
+def viewer_liked_post(post_id: str, viewer_id: str | None):
+    if not post_id or not viewer_id:
+        return False
+
+    try:
+        res = (
+            supabase.table("post_likes")
+            .select("post_id,user_id")
+            .eq("post_id", post_id)
+            .eq("user_id", viewer_id)
+            .limit(1)
+            .execute()
+        )
+        return bool(res.data)
+    except Exception:
+        return False
+
+
+def safe_session_post(row: dict, profiles_by_id: dict, viewer_id: str | None = None):
     author_id = str(row.get("user_id") or "")
     profile = profiles_by_id.get(author_id) or normalize_profile({"id": author_id})
 
+    post_id = str(row.get("id") or "")
     visibility = (row.get("visibility") or row.get("privacy") or "public")
     class_mode = row.get("class_mode") or "class"
     difficulty = row.get("difficulty") or ""
     length_min = row.get("length_min") or row.get("length") or ""
     music = row.get("music") or ""
+    pace = row.get("pace") or ""
     created_at = row.get("created_at")
 
     title = row.get("title") or "Completed a Corner class."
     body = row.get("body") or row.get("caption") or "Finished a verified boxing session."
+
+    likes_count = safe_int(row.get("likes_count"), 0)
+    comments_count = safe_int(row.get("comments_count"), 0)
+
+    # Backfill counts for old rows where stored counters may still be zero.
+    actual_likes = count_post_likes(post_id)
+    actual_comments = count_post_comments(post_id)
+    likes_count = max(likes_count, actual_likes)
+    comments_count = max(comments_count, actual_comments)
 
     tags = []
     if class_mode:
@@ -657,6 +706,10 @@ def safe_session_post(row: dict, profiles_by_id: dict):
         tags.append(str(difficulty).title())
     if length_min:
         tags.append(f"{length_min} min")
+    if pace:
+        tags.append(str(pace))
+    if music:
+        tags.append(f"Music: {music}")
     if visibility:
         tags.append(str(visibility).replace("_", "-"))
 
@@ -667,11 +720,21 @@ def safe_session_post(row: dict, profiles_by_id: dict):
         "title": title,
         "body": body,
         "created_at": created_at,
-        "tags": tags[:4],
+        "updated_at": row.get("updated_at"),
+        "edited_at": row.get("edited_at"),
+        "tags": tags[:6],
         "visibility": visibility,
         "class_session_id": row.get("class_session_id"),
         "job_id": row.get("job_id"),
         "music": music,
+        "pace": pace,
+        "difficulty": difficulty,
+        "length_min": length_min,
+        "class_mode": class_mode,
+        "likes_count": likes_count,
+        "comments_count": comments_count,
+        "liked_by_me": viewer_liked_post(post_id, viewer_id),
+        "is_owner": bool(viewer_id and author_id and viewer_id == author_id),
     }
 
 
@@ -729,6 +792,7 @@ def create_session_post_for_completed_session(session_row: dict):
     length_min = safe_int(length_min_raw, 0)
     class_mode = session_row.get("class_mode") or "full"
     music = session_row.get("music") or ""
+    pace = session_row.get("pace") or ""
 
     title = "Completed a verified Corner class."
     body_bits = []
@@ -759,6 +823,9 @@ def create_session_post_for_completed_session(session_row: dict):
         "difficulty": str(difficulty),
         "length_min": length_min if length_min else None,
         "music": str(music),
+        "pace": str(pace),
+        "likes_count": 0,
+        "comments_count": 0,
     }
 
     # Remove None values so older schemas are less likely to reject the insert.
@@ -981,7 +1048,7 @@ def home_feed():
 
         return jsonify({
             "status": "ok",
-            "items": [safe_session_post(row, profiles_by_id) for row in visible_posts],
+            "items": [safe_session_post(row, profiles_by_id, viewer_id=uid) for row in visible_posts],
         }), 200
 
     except Exception as e:
@@ -1207,7 +1274,7 @@ def profile_posts(profile_id):
 
         return jsonify({
             "status": "ok",
-            "items": [safe_session_post(row, profiles_by_id) for row in visible],
+            "items": [safe_session_post(row, profiles_by_id, viewer_id=viewer_id) for row in visible],
         }), 200
 
     except Exception as e:
@@ -1217,6 +1284,375 @@ def profile_posts(profile_id):
             "details": str(e),
         }), 500
 
+def can_view_post(row: dict, viewer_id: str | None):
+    if not row:
+        return False
+
+    author_id = str(row.get("user_id") or "")
+    visibility = str(row.get("visibility") or "public").lower()
+
+    if viewer_id and viewer_id == author_id:
+        return True
+
+    if visibility == "public":
+        return True
+
+    if visibility in ("friends", "friends_only", "followers", "followers_only"):
+        if not viewer_id:
+            return False
+        following_ids = load_following_ids(viewer_id)
+        return author_id in following_ids
+
+    return False
+
+
+def load_post_row(post_id: str):
+    if not post_id:
+        return None
+
+    res = (
+        supabase.table("session_posts")
+        .select("*")
+        .eq("id", post_id)
+        .limit(1)
+        .execute()
+    )
+
+    return res.data[0] if res.data else None
+
+
+def update_post_counts(post_id: str):
+    if not post_id:
+        return
+
+    likes_count = count_post_likes(post_id)
+    comments_count = count_post_comments(post_id)
+
+    try:
+        supabase.table("session_posts").update({
+            "likes_count": likes_count,
+            "comments_count": comments_count,
+            "updated_at": utc_now_iso(),
+        }).eq("id", post_id).execute()
+    except Exception:
+        pass
+
+
+@app.route("/session-post/<post_id>", methods=["PATCH", "DELETE"])
+def update_or_delete_session_post(post_id):
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    post_id = str(post_id or "").strip()
+    row = load_post_row(post_id)
+
+    if not row:
+        return jsonify({
+            "status": "error",
+            "error": "Post not found.",
+        }), 404
+
+    if str(row.get("user_id") or "") != uid:
+        return jsonify({
+            "status": "error",
+            "error": "Forbidden.",
+        }), 403
+
+    if request.method == "DELETE":
+        try:
+            supabase.table("session_posts").delete().eq("id", post_id).execute()
+            return jsonify({
+                "status": "ok",
+                "deleted": True,
+                "post_id": post_id,
+            }), 200
+        except Exception as e:
+            return jsonify({
+                "status": "error",
+                "error": "Could not delete post.",
+                "details": str(e),
+            }), 500
+
+    data = request.get_json(force=True, silent=True) or {}
+
+    title = str(data.get("title") or "").strip()
+    body = str(data.get("body") or "").strip()
+    visibility = str(data.get("visibility") or row.get("visibility") or "friends_only").strip().lower()
+
+    allowed_visibility = {"public", "friends_only", "followers", "followers_only", "private"}
+    if visibility not in allowed_visibility:
+        visibility = "friends_only"
+
+    if not title:
+        title = "Completed a verified Corner class."
+
+    if len(title) > 80:
+        return jsonify({
+            "status": "error",
+            "error": "Title must be 80 characters or less.",
+        }), 400
+
+    if len(body) > 500:
+        return jsonify({
+            "status": "error",
+            "error": "Description must be 500 characters or less.",
+        }), 400
+
+    try:
+        update_payload = {
+            "title": title,
+            "body": body,
+            "visibility": visibility,
+            "edited_at": utc_now_iso(),
+            "updated_at": utc_now_iso(),
+        }
+
+        res = (
+            supabase.table("session_posts")
+            .update(update_payload)
+            .eq("id", post_id)
+            .execute()
+        )
+
+        saved = res.data[0] if res.data else load_post_row(post_id)
+        profiles_by_id = load_profiles_map([uid])
+
+        return jsonify({
+            "status": "ok",
+            "post": safe_session_post(saved, profiles_by_id, viewer_id=uid),
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not update post.",
+            "details": str(e),
+        }), 500
+
+
+@app.route("/session-post/<post_id>/like", methods=["POST", "DELETE"])
+def like_session_post(post_id):
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    post_id = str(post_id or "").strip()
+    row = load_post_row(post_id)
+
+    if not row:
+        return jsonify({
+            "status": "error",
+            "error": "Post not found.",
+        }), 404
+
+    if not can_view_post(row, uid):
+        return jsonify({
+            "status": "error",
+            "error": "Forbidden.",
+        }), 403
+
+    try:
+        if request.method == "DELETE":
+            supabase.table("post_likes").delete().eq("post_id", post_id).eq("user_id", uid).execute()
+            update_post_counts(post_id)
+
+            return jsonify({
+                "status": "ok",
+                "liked": False,
+                "likes_count": count_post_likes(post_id),
+            }), 200
+
+        existing = (
+            supabase.table("post_likes")
+            .select("post_id,user_id")
+            .eq("post_id", post_id)
+            .eq("user_id", uid)
+            .limit(1)
+            .execute()
+        )
+
+        if not existing.data:
+            supabase.table("post_likes").insert({
+                "post_id": post_id,
+                "user_id": uid,
+            }).execute()
+
+        update_post_counts(post_id)
+
+        return jsonify({
+            "status": "ok",
+            "liked": True,
+            "likes_count": count_post_likes(post_id),
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not update like.",
+            "details": str(e),
+        }), 500
+
+
+@app.route("/session-post/<post_id>/comments", methods=["GET", "POST"])
+def session_post_comments(post_id):
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    post_id = str(post_id or "").strip()
+    row = load_post_row(post_id)
+
+    if not row:
+        return jsonify({
+            "status": "error",
+            "error": "Post not found.",
+        }), 404
+
+    if not can_view_post(row, uid):
+        return jsonify({
+            "status": "error",
+            "error": "Forbidden.",
+        }), 403
+
+    if request.method == "POST":
+        data = request.get_json(force=True, silent=True) or {}
+        body = str(data.get("body") or "").strip()
+
+        if not body:
+            return jsonify({
+                "status": "error",
+                "error": "Comment cannot be empty.",
+            }), 400
+
+        if len(body) > 500:
+            return jsonify({
+                "status": "error",
+                "error": "Comment must be 500 characters or less.",
+            }), 400
+
+        try:
+            insert_res = supabase.table("post_comments").insert({
+                "post_id": post_id,
+                "user_id": uid,
+                "body": body,
+            }).execute()
+
+            update_post_counts(post_id)
+
+            comment = insert_res.data[0] if insert_res.data else None
+            profiles_by_id = load_profiles_map([uid])
+
+            return jsonify({
+                "status": "ok",
+                "comment": safe_comment(comment, profiles_by_id, uid) if comment else None,
+                "comments_count": count_post_comments(post_id),
+            }), 201
+
+        except Exception as e:
+            return jsonify({
+                "status": "error",
+                "error": "Could not add comment.",
+                "details": str(e),
+            }), 500
+
+    try:
+        comments_res = (
+            supabase.table("post_comments")
+            .select("*")
+            .eq("post_id", post_id)
+            .order("created_at", desc=False)
+            .limit(100)
+            .execute()
+        )
+
+        comments = comments_res.data or []
+        author_ids = [str(c.get("user_id")) for c in comments if c.get("user_id")]
+        profiles_by_id = load_profiles_map(author_ids)
+
+        return jsonify({
+            "status": "ok",
+            "items": [safe_comment(c, profiles_by_id, uid) for c in comments],
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not load comments.",
+            "details": str(e),
+        }), 500
+
+
+@app.route("/session-comment/<comment_id>", methods=["DELETE"])
+def delete_session_comment(comment_id):
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    comment_id = str(comment_id or "").strip()
+
+    try:
+        comment_res = (
+            supabase.table("post_comments")
+            .select("*")
+            .eq("id", comment_id)
+            .limit(1)
+            .execute()
+        )
+
+        if not comment_res.data:
+            return jsonify({
+                "status": "error",
+                "error": "Comment not found.",
+            }), 404
+
+        comment = comment_res.data[0]
+        post_id = str(comment.get("post_id") or "")
+        post = load_post_row(post_id)
+
+        is_comment_owner = str(comment.get("user_id") or "") == uid
+        is_post_owner = bool(post and str(post.get("user_id") or "") == uid)
+
+        if not is_comment_owner and not is_post_owner:
+            return jsonify({
+                "status": "error",
+                "error": "Forbidden.",
+            }), 403
+
+        supabase.table("post_comments").delete().eq("id", comment_id).execute()
+        update_post_counts(post_id)
+
+        return jsonify({
+            "status": "ok",
+            "deleted": True,
+            "comment_id": comment_id,
+            "comments_count": count_post_comments(post_id),
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not delete comment.",
+            "details": str(e),
+        }), 500
+
+
+def safe_comment(row: dict | None, profiles_by_id: dict, viewer_id: str | None):
+    if not row:
+        return None
+
+    author_id = str(row.get("user_id") or "")
+    author = profiles_by_id.get(author_id) or normalize_profile({"id": author_id})
+
+    return {
+        "id": row.get("id"),
+        "post_id": row.get("post_id"),
+        "body": row.get("body") or "",
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+        "author": author,
+        "is_owner": bool(viewer_id and author_id and viewer_id == author_id),
+    }
 
 @app.route("/search/users", methods=["GET"])
 def search_users():
