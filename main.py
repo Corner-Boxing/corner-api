@@ -705,21 +705,28 @@ def create_session_post_for_completed_session(session_row: dict):
     job_id = session_row.get("job_id")
 
     if not user_id or not session_id:
-        return None
+        return {
+            "post": None,
+            "error": "missing_user_id_or_class_session_id",
+        }
 
     existing = (
         supabase.table("session_posts")
-        .select("id")
+        .select("*")
         .eq("class_session_id", session_id)
         .limit(1)
         .execute()
     )
 
     if existing.data:
-        return existing.data[0]
+        return {
+            "post": existing.data[0],
+            "error": None,
+        }
 
     difficulty = session_row.get("difficulty") or ""
-    length_min = session_row.get("length_min") or ""
+    length_min_raw = session_row.get("length_min")
+    length_min = safe_int(length_min_raw, 0)
     class_mode = session_row.get("class_mode") or "full"
     music = session_row.get("music") or ""
 
@@ -736,36 +743,86 @@ def create_session_post_for_completed_session(session_row: dict):
 
     body = "Finished a verified " + " ".join(body_bits) + "."
 
-    visibility = "public" if bool(session_row.get("is_public")) else "followers"
+    # Important:
+    # Some earlier table versions may reject "followers" with a visibility CHECK constraint.
+    # Use values most likely to survive old/new schemas.
+    preferred_visibility = "public" if bool(session_row.get("is_public")) else "friends_only"
 
-    payload = {
-        "user_id": user_id,
-        "class_session_id": session_id,
-        "job_id": job_id,
+    base_payload = {
+        "user_id": str(user_id),
+        "class_session_id": str(session_id),
+        "job_id": str(job_id) if job_id else None,
         "title": title,
         "body": body,
-        "visibility": visibility,
-        "class_mode": class_mode,
-        "difficulty": difficulty,
-        "length_min": length_min,
-        "music": music,
+        "visibility": preferred_visibility,
+        "class_mode": str(class_mode),
+        "difficulty": str(difficulty),
+        "length_min": length_min if length_min else None,
+        "music": str(music),
     }
 
-    try:
-        res = supabase.table("session_posts").insert(payload).execute()
-        if res.data:
-            return res.data[0]
-        return None
-    except Exception:
-        # Duplicate race fallback.
-        retry = (
-            supabase.table("session_posts")
-            .select("id")
-            .eq("class_session_id", session_id)
-            .limit(1)
-            .execute()
-        )
-        return retry.data[0] if retry.data else None
+    # Remove None values so older schemas are less likely to reject the insert.
+    base_payload = {k: v for k, v in base_payload.items() if v is not None}
+
+    last_error = None
+
+    # Try multiple visibility values in case the DB already had a CHECK constraint.
+    visibility_attempts = [preferred_visibility, "followers", "public"]
+
+    for visibility in visibility_attempts:
+        payload = {**base_payload, "visibility": visibility}
+
+        try:
+            res = supabase.table("session_posts").insert(payload).execute()
+
+            if res.data:
+                return {
+                    "post": res.data[0],
+                    "error": None,
+                }
+
+            # Supabase may insert but return no rows depending on client behavior.
+            verify = (
+                supabase.table("session_posts")
+                .select("*")
+                .eq("class_session_id", session_id)
+                .limit(1)
+                .execute()
+            )
+
+            if verify.data:
+                return {
+                    "post": verify.data[0],
+                    "error": None,
+                }
+
+            last_error = "insert_returned_no_data"
+
+        except Exception as e:
+            last_error = str(e)
+
+            # Duplicate race fallback.
+            try:
+                retry = (
+                    supabase.table("session_posts")
+                    .select("*")
+                    .eq("class_session_id", session_id)
+                    .limit(1)
+                    .execute()
+                )
+
+                if retry.data:
+                    return {
+                        "post": retry.data[0],
+                        "error": None,
+                    }
+            except Exception as retry_error:
+                last_error = f"{last_error} | retry_error={str(retry_error)}"
+
+    return {
+        "post": None,
+        "error": last_error or "post_insert_failed",
+    }
 
 
 @app.route("/class-session/<job_id>/listen-heartbeat", methods=["POST"])
@@ -839,6 +896,8 @@ def listen_heartbeat(job_id):
         supabase.table("class_sessions").update(update_payload).eq("id", session_row.get("id")).execute()
 
         post = None
+        post_error = None
+
         if already_complete or completed_now:
             refreshed = (
                 supabase.table("class_sessions")
@@ -847,8 +906,12 @@ def listen_heartbeat(job_id):
                 .limit(1)
                 .execute()
             )
+
             refreshed_row = refreshed.data[0] if refreshed.data else {**session_row, **update_payload}
-            post = create_session_post_for_completed_session(refreshed_row)
+
+            post_result = create_session_post_for_completed_session(refreshed_row)
+            post = post_result.get("post") if isinstance(post_result, dict) else post_result
+            post_error = post_result.get("error") if isinstance(post_result, dict) else None
 
         return jsonify({
             "status": "ok",
@@ -858,6 +921,8 @@ def listen_heartbeat(job_id):
             "listen_required_seconds": required_seconds,
             "audio_position_seconds": audio_position_seconds,
             "post": post,
+            "post_created": bool(post),
+            "post_error": post_error,
         }), 200
 
     except Exception as e:
