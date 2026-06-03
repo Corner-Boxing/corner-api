@@ -1087,6 +1087,7 @@ def home_feed():
         allowed_user_ids = set(following_ids)
         allowed_user_ids.add(uid)
 
+        # Normal verified session posts.
         posts_res = (
             supabase.table("session_posts")
             .select("*")
@@ -1118,14 +1119,63 @@ def home_feed():
                 if author_id:
                     author_ids.append(author_id)
 
-            if len(visible_posts) >= 30:
+            if len(visible_posts) >= 25:
                 break
 
         profiles_by_id = load_profiles_map(author_ids)
+        feed_items = [safe_session_post(row, profiles_by_id, viewer_id=uid) for row in visible_posts]
+
+        # Reasonable gym activity in home feed:
+        # only session shares + system updates, not every chat message.
+        gym, _membership = get_my_gym_membership(uid)
+
+        if gym:
+            gym_posts_res = (
+                supabase.table("gym_posts")
+                .select("*")
+                .eq("gym_id", gym["id"])
+                .in_("kind", ["session", "system"])
+                .order("created_at", desc=True)
+                .limit(10)
+                .execute()
+            )
+
+            gym_rows = gym_posts_res.data or []
+            gym_author_ids = [str(r.get("user_id")) for r in gym_rows if r.get("user_id")]
+            gym_profiles = load_profiles_map(gym_author_ids)
+
+            session_post_ids = [str(r.get("session_post_id")) for r in gym_rows if r.get("session_post_id")]
+            session_posts_by_id = {}
+
+            if session_post_ids:
+                linked_res = (
+                    supabase.table("session_posts")
+                    .select("*")
+                    .in_("id", session_post_ids)
+                    .execute()
+                )
+
+                linked_rows = linked_res.data or []
+                linked_author_ids = [str(r.get("user_id")) for r in linked_rows if r.get("user_id")]
+                linked_profiles = load_profiles_map(linked_author_ids)
+
+                for linked in linked_rows:
+                    session_posts_by_id[str(linked.get("id"))] = safe_session_post(linked, linked_profiles, viewer_id=uid)
+
+            for row in gym_rows:
+                safe_item = safe_gym_post(row, gym_profiles, session_posts_by_id)
+                safe_item["type"] = "gym_post"
+                safe_item["gym"] = gym
+                feed_items.append(safe_item)
+
+        feed_items.sort(
+            key=lambda item: item.get("created_at") or "",
+            reverse=True
+        )
 
         return jsonify({
             "status": "ok",
-            "items": [safe_session_post(row, profiles_by_id, viewer_id=uid) for row in visible_posts],
+            "items": feed_items[:35],
         }), 200
 
     except Exception as e:
@@ -1186,6 +1236,31 @@ def home_notifications():
             "details": str(e),
         }), 500
 
+@app.route("/home/notifications/<notification_id>/read", methods=["POST"])
+def mark_notification_read(notification_id):
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    notification_id = str(notification_id or "").strip()
+
+    try:
+        supabase.table("notifications").update({
+            "read": True,
+        }).eq("id", notification_id).eq("user_id", uid).execute()
+
+        return jsonify({
+            "status": "ok",
+            "notification_id": notification_id,
+            "read": True,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not mark notification read.",
+            "details": str(e),
+        }), 500
 
 @app.route("/home/suggestions", methods=["GET"])
 def home_suggestions():
@@ -1291,6 +1366,19 @@ def follow_user(target_user_id):
                     "error": "Follow insert failed.",
                     "details": insert_err,
                 }), 500
+
+            actor_profile = ensure_profile_row(uid)
+            actor_name = profile_display_name(actor_profile)
+
+            create_notification(
+                target_user_id,
+                uid,
+                "follow",
+                f"{actor_name} followed you.",
+                "You have a new follower on Corner.",
+                "profile",
+                uid,
+            )
 
         return jsonify({
             "status": "ok",
@@ -1555,6 +1643,20 @@ def like_session_post(post_id):
                 "user_id": uid,
             }).execute()
 
+            owner_id = str(row.get("user_id") or "")
+            actor_profile = ensure_profile_row(uid)
+            actor_name = profile_display_name(actor_profile)
+
+            create_notification(
+                owner_id,
+                uid,
+                "like",
+                f"{actor_name} liked your session.",
+                row.get("title") or "Someone liked your verified Corner session.",
+                "session_post",
+                post_id,
+            )
+
         update_post_counts(post_id)
 
         return jsonify({
@@ -1616,6 +1718,20 @@ def session_post_comments(post_id):
             }).execute()
 
             update_post_counts(post_id)
+
+            owner_id = str(row.get("user_id") or "")
+            actor_profile = ensure_profile_row(uid)
+            actor_name = profile_display_name(actor_profile)
+
+            create_notification(
+                owner_id,
+                uid,
+                "comment",
+                f"{actor_name} commented on your session.",
+                body,
+                "session_post",
+                post_id,
+            )
 
             comment = insert_res.data[0] if insert_res.data else None
             profiles_by_id = load_profiles_map([uid])
@@ -1730,6 +1846,75 @@ def safe_comment(row: dict | None, profiles_by_id: dict, viewer_id: str | None):
         "author": author,
         "is_owner": bool(viewer_id and author_id and viewer_id == author_id),
     }
+
+def create_notification(
+    user_id: str | None,
+    actor_id: str | None,
+    type_: str,
+    title: str,
+    body: str = "",
+    entity_type: str | None = None,
+    entity_id: str | None = None,
+):
+    if not user_id:
+        return
+
+    # Do not notify yourself. It feels broken and noisy.
+    if actor_id and str(user_id) == str(actor_id):
+        return
+
+    try:
+        payload = {
+            "user_id": str(user_id),
+            "actor_id": str(actor_id) if actor_id else None,
+            "type": str(type_ or "notification"),
+            "title": str(title or "Notification")[:120],
+            "body": str(body or "")[:500],
+            "entity_type": entity_type,
+            "entity_id": str(entity_id) if entity_id else None,
+            "read": False,
+        }
+
+        payload = {k: v for k, v in payload.items() if v is not None}
+        supabase.table("notifications").insert(payload).execute()
+    except Exception:
+        # Notifications should never break the main action.
+        pass
+
+
+def notify_gym_members(
+    gym_id: str,
+    actor_id: str | None,
+    type_: str,
+    title: str,
+    body: str = "",
+    entity_type: str | None = "gym",
+    entity_id: str | None = None,
+):
+    if not gym_id:
+        return
+
+    try:
+        members = (
+            supabase.table("gym_members")
+            .select("user_id")
+            .eq("gym_id", gym_id)
+            .execute()
+        )
+
+        for row in (members.data or []):
+            member_id = row.get("user_id")
+            create_notification(
+                member_id,
+                actor_id,
+                type_,
+                title,
+                body,
+                entity_type,
+                entity_id or gym_id,
+            )
+    except Exception:
+        pass
 
 def get_my_gym_membership(user_id: str):
     if not user_id:
@@ -2131,6 +2316,16 @@ def join_gym(gym_id):
             "body": f"{display} joined the gym.",
         }).execute()
 
+        notify_gym_members(
+            gym_id,
+            uid,
+            "gym_join",
+            f"{display} joined your gym.",
+            "A new member joined the gym.",
+            "gym",
+            gym_id,
+        )
+
         gym, membership = get_my_gym_membership(uid)
 
         return jsonify({
@@ -2267,6 +2462,19 @@ def gym_posts(gym_id):
                 "body": body,
             }).execute()
 
+            actor_profile = ensure_profile_row(uid)
+            actor_name = profile_display_name(actor_profile)
+
+            notify_gym_members(
+                gym_id,
+                uid,
+                "gym_message",
+                f"{actor_name} posted in your gym.",
+                body,
+                "gym",
+                gym_id,
+            )
+
             return jsonify({
                 "status": "ok",
                 "items": load_gym_posts(gym_id, uid),
@@ -2292,6 +2500,158 @@ def gym_posts(gym_id):
             "details": str(e),
         }), 500
 
+@app.route("/gyms/<gym_id>/invite", methods=["POST"])
+def create_gym_invite(gym_id):
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    gym_id = str(gym_id or "").strip()
+
+    if not user_is_gym_member(gym_id, uid):
+        return jsonify({
+            "status": "error",
+            "error": "You must be a member to create an invite.",
+        }), 403
+
+    try:
+        existing = (
+            supabase.table("gym_invites")
+            .select("*")
+            .eq("gym_id", gym_id)
+            .eq("created_by", uid)
+            .eq("active", True)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+
+        if existing.data:
+            invite = existing.data[0]
+        else:
+            code = base64.urlsafe_b64encode(os.urandom(9)).decode("utf-8").replace("=", "")
+
+            invite_res = supabase.table("gym_invites").insert({
+                "gym_id": gym_id,
+                "created_by": uid,
+                "code": code,
+                "active": True,
+            }).execute()
+
+            invite = invite_res.data[0] if invite_res.data else {"code": code}
+
+        return jsonify({
+            "status": "ok",
+            "code": invite.get("code"),
+            "join_text": f"Join my Corner gym with code: {invite.get('code')}",
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not create invite.",
+            "details": str(e),
+        }), 500
+
+
+@app.route("/gyms/join-code/<code>", methods=["POST"])
+def join_gym_by_code(code):
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    code = str(code or "").strip()
+
+    if not code:
+        return jsonify({
+            "status": "error",
+            "error": "Missing invite code.",
+        }), 400
+
+    try:
+        existing_gym, _ = get_my_gym_membership(uid)
+        if existing_gym:
+            return jsonify({
+                "status": "error",
+                "error": "You are already in a gym. Leave it before joining another.",
+                "gym": existing_gym,
+            }), 409
+
+        invite_res = (
+            supabase.table("gym_invites")
+            .select("*")
+            .eq("code", code)
+            .eq("active", True)
+            .limit(1)
+            .execute()
+        )
+
+        if not invite_res.data:
+            return jsonify({
+                "status": "error",
+                "error": "Invite code not found.",
+            }), 404
+
+        invite = invite_res.data[0]
+        gym_id = str(invite.get("gym_id") or "")
+
+        gym_res = (
+            supabase.table("gyms")
+            .select("*")
+            .eq("id", gym_id)
+            .limit(1)
+            .execute()
+        )
+
+        if not gym_res.data:
+            return jsonify({
+                "status": "error",
+                "error": "Gym not found.",
+            }), 404
+
+        supabase.table("gym_members").insert({
+            "gym_id": gym_id,
+            "user_id": uid,
+            "role": "member",
+            "joined_at": utc_now_iso(),
+        }).execute()
+
+        refresh_gym_member_count(gym_id)
+
+        profile = ensure_profile_row(uid)
+        display = profile_display_name(profile)
+
+        supabase.table("gym_posts").insert({
+            "gym_id": gym_id,
+            "user_id": uid,
+            "kind": "system",
+            "body": f"{display} joined by invite code.",
+        }).execute()
+
+        notify_gym_members(
+            gym_id,
+            uid,
+            "gym_join",
+            f"{display} joined your gym.",
+            "A new member joined through an invite code.",
+            "gym",
+            gym_id,
+        )
+
+        gym, membership = get_my_gym_membership(uid)
+
+        return jsonify({
+            "status": "ok",
+            "gym": gym,
+            "membership": membership,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not join with invite code.",
+            "details": str(e),
+        }), 500
 
 @app.route("/gyms/<gym_id>/share-session", methods=["POST"])
 def share_session_to_gym(gym_id):
@@ -2362,6 +2722,19 @@ def share_session_to_gym(gym_id):
                 "body": title,
                 "session_post_id": session_post_id,
             }).execute()
+
+            actor_profile = ensure_profile_row(uid)
+            actor_name = profile_display_name(actor_profile)
+
+            notify_gym_members(
+                gym_id,
+                uid,
+                "gym_session",
+                f"{actor_name} shared a verified session.",
+                title,
+                "session_post",
+                session_post_id,
+            )
 
         return jsonify({
             "status": "ok",
