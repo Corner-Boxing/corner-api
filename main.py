@@ -618,6 +618,82 @@ def count_following(user_id: str):
         return 0
 
 
+def clean_gym_slug(value: str | None):
+    raw = str(value or "").strip().lower()
+    raw = re.sub(r"[^a-z0-9]+", "-", raw)
+    raw = re.sub(r"-+", "-", raw).strip("-")
+    return raw[:36] or "corner-gym"
+
+
+def count_gym_members(gym_id: str):
+    if not gym_id:
+        return 0
+    try:
+        res = supabase.table("gym_members").select("user_id").eq("gym_id", gym_id).execute()
+        return len(res.data or [])
+    except Exception:
+        return 0
+
+
+def get_user_primary_gym(user_id: str | None):
+    if not user_id:
+        return None
+
+    try:
+        mem_res = (
+            supabase.table("gym_members")
+            .select("gym_id,role,joined_at")
+            .eq("user_id", user_id)
+            .order("joined_at", desc=False)
+            .limit(1)
+            .execute()
+        )
+
+        if not mem_res.data:
+            return None
+
+        membership = mem_res.data[0]
+        gym_id = membership.get("gym_id")
+
+        gym_res = (
+            supabase.table("gyms")
+            .select("*")
+            .eq("id", gym_id)
+            .limit(1)
+            .execute()
+        )
+
+        if not gym_res.data:
+            return None
+
+        gym = normalize_gym(gym_res.data[0], membership=membership)
+        return gym
+
+    except Exception:
+        return None
+
+
+def normalize_gym(row: dict | None, membership: dict | None = None):
+    row = row or {}
+    gym_id = str(row.get("id") or "")
+
+    return {
+        "id": row.get("id"),
+        "name": row.get("name") or "Corner Gym",
+        "slug": row.get("slug") or "",
+        "description": row.get("description") or "",
+        "badge_url": row.get("badge_url") or "assets/gyms/default-gym-badge.png",
+        "banner_url": row.get("banner_url") or "assets/gyms/default-gym-banner.jpg",
+        "visibility": row.get("visibility") or "public",
+        "owner_id": row.get("owner_id"),
+        "member_count": safe_int(row.get("member_count"), 0) or count_gym_members(gym_id),
+        "created_at": row.get("created_at"),
+        "updated_at": row.get("updated_at"),
+        "my_role": membership.get("role") if membership else None,
+        "joined_at": membership.get("joined_at") if membership else None,
+    }
+
+
 def profile_payload(profile: dict | None, viewer_id: str | None = None):
     clean = normalize_profile(profile)
 
@@ -632,6 +708,7 @@ def profile_payload(profile: dict | None, viewer_id: str | None = None):
     clean["following"] = following
     clean["followers_count"] = count_followers(profile_id) if profile_id else 0
     clean["following_count"] = count_following(profile_id) if profile_id else 0
+    clean["primary_gym"] = get_user_primary_gym(profile_id) if profile_id else None
 
     return clean
 
@@ -1653,6 +1730,650 @@ def safe_comment(row: dict | None, profiles_by_id: dict, viewer_id: str | None):
         "author": author,
         "is_owner": bool(viewer_id and author_id and viewer_id == author_id),
     }
+
+def get_my_gym_membership(user_id: str):
+    if not user_id:
+        return None, None
+
+    mem_res = (
+        supabase.table("gym_members")
+        .select("gym_id,user_id,role,joined_at")
+        .eq("user_id", user_id)
+        .order("joined_at", desc=False)
+        .limit(1)
+        .execute()
+    )
+
+    if not mem_res.data:
+        return None, None
+
+    membership = mem_res.data[0]
+    gym_id = membership.get("gym_id")
+
+    gym_res = (
+        supabase.table("gyms")
+        .select("*")
+        .eq("id", gym_id)
+        .limit(1)
+        .execute()
+    )
+
+    if not gym_res.data:
+        return None, None
+
+    return normalize_gym(gym_res.data[0], membership=membership), membership
+
+
+def user_is_gym_member(gym_id: str, user_id: str):
+    if not gym_id or not user_id:
+        return False
+
+    try:
+        res = (
+            supabase.table("gym_members")
+            .select("gym_id,user_id")
+            .eq("gym_id", gym_id)
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+        return bool(res.data)
+    except Exception:
+        return False
+
+
+def load_gym_members(gym_id: str):
+    try:
+        mem_res = (
+            supabase.table("gym_members")
+            .select("gym_id,user_id,role,joined_at")
+            .eq("gym_id", gym_id)
+            .order("joined_at", desc=False)
+            .limit(100)
+            .execute()
+        )
+
+        members = mem_res.data or []
+        user_ids = [str(m.get("user_id")) for m in members if m.get("user_id")]
+        profiles_by_id = load_profiles_map(user_ids)
+
+        items = []
+        for m in members:
+            uid = str(m.get("user_id") or "")
+            profile = profiles_by_id.get(uid) or normalize_profile({"id": uid})
+            items.append({
+                "user_id": uid,
+                "role": m.get("role") or "member",
+                "joined_at": m.get("joined_at"),
+                "profile": profile_payload(profile, viewer_id=None),
+            })
+
+        return items
+    except Exception:
+        return []
+
+
+def safe_gym_post(row: dict, profiles_by_id: dict, session_posts_by_id: dict | None = None):
+    author_id = str(row.get("user_id") or "")
+    profile = profiles_by_id.get(author_id) or normalize_profile({"id": author_id})
+    session_post_id = str(row.get("session_post_id") or "")
+    linked_post = None
+
+    if session_post_id and session_posts_by_id:
+        linked_post = session_posts_by_id.get(session_post_id)
+
+    return {
+        "id": row.get("id"),
+        "gym_id": row.get("gym_id"),
+        "kind": row.get("kind") or "message",
+        "body": row.get("body") or "",
+        "created_at": row.get("created_at"),
+        "author": profile,
+        "session_post_id": row.get("session_post_id"),
+        "session_post": linked_post,
+    }
+
+
+def load_gym_posts(gym_id: str, viewer_id: str):
+    posts_res = (
+        supabase.table("gym_posts")
+        .select("*")
+        .eq("gym_id", gym_id)
+        .order("created_at", desc=True)
+        .limit(80)
+        .execute()
+    )
+
+    rows = posts_res.data or []
+    author_ids = [str(r.get("user_id")) for r in rows if r.get("user_id")]
+    session_post_ids = [str(r.get("session_post_id")) for r in rows if r.get("session_post_id")]
+
+    profiles_by_id = load_profiles_map(author_ids)
+    session_posts_by_id = {}
+
+    if session_post_ids:
+        sp_res = (
+            supabase.table("session_posts")
+            .select("*")
+            .in_("id", session_post_ids)
+            .execute()
+        )
+
+        raw_session_posts = sp_res.data or []
+        sp_author_ids = [str(r.get("user_id")) for r in raw_session_posts if r.get("user_id")]
+        sp_profiles = load_profiles_map(sp_author_ids)
+
+        for sp in raw_session_posts:
+            session_posts_by_id[str(sp.get("id"))] = safe_session_post(sp, sp_profiles, viewer_id=viewer_id)
+
+    return [safe_gym_post(row, profiles_by_id, session_posts_by_id) for row in rows]
+
+
+def refresh_gym_member_count(gym_id: str):
+    total = count_gym_members(gym_id)
+    try:
+        supabase.table("gyms").update({
+            "member_count": total,
+            "updated_at": utc_now_iso(),
+        }).eq("id", gym_id).execute()
+    except Exception:
+        pass
+    return total
+
+
+@app.route("/gyms/me", methods=["GET"])
+def my_gym():
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    try:
+        gym, membership = get_my_gym_membership(uid)
+
+        if not gym:
+            return jsonify({
+                "status": "ok",
+                "has_gym": False,
+                "gym": None,
+                "members": [],
+                "posts": [],
+            }), 200
+
+        posts = load_gym_posts(gym["id"], uid)
+        members = load_gym_members(gym["id"])
+
+        return jsonify({
+            "status": "ok",
+            "has_gym": True,
+            "gym": gym,
+            "membership": membership,
+            "members": members,
+            "posts": posts,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not load gym.",
+            "details": str(e),
+        }), 500
+
+
+@app.route("/gyms/discover", methods=["GET"])
+def discover_gyms():
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    q = str(request.args.get("q") or "").strip().lower()
+
+    try:
+        my_gym, _ = get_my_gym_membership(uid)
+        my_gym_id = str(my_gym.get("id")) if my_gym else None
+
+        res = (
+            supabase.table("gyms")
+            .select("*")
+            .eq("visibility", "public")
+            .order("created_at", desc=True)
+            .limit(80)
+            .execute()
+        )
+
+        items = []
+
+        for row in (res.data or []):
+            name = str(row.get("name") or "").lower()
+            slug = str(row.get("slug") or "").lower()
+            desc = str(row.get("description") or "").lower()
+
+            if q and q not in f"{name} {slug} {desc}":
+                continue
+
+            gym = normalize_gym(row)
+            gym["already_joined"] = bool(my_gym_id and my_gym_id == str(gym.get("id")))
+            items.append(gym)
+
+            if len(items) >= 30:
+                break
+
+        return jsonify({
+            "status": "ok",
+            "items": items,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not discover gyms.",
+            "details": str(e),
+        }), 500
+
+
+@app.route("/gyms/create", methods=["POST"])
+def create_gym():
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    data = request.get_json(force=True, silent=True) or {}
+
+    name = str(data.get("name") or "").strip()
+    description = str(data.get("description") or "").strip()
+    visibility = str(data.get("visibility") or "public").strip().lower()
+
+    if not name or len(name) > 40:
+        return jsonify({
+            "status": "error",
+            "error": "Gym name must be 1-40 characters.",
+        }), 400
+
+    if len(description) > 240:
+        return jsonify({
+            "status": "error",
+            "error": "Gym description must be 240 characters or less.",
+        }), 400
+
+    if visibility not in ("public", "private"):
+        visibility = "public"
+
+    try:
+        existing_gym, _ = get_my_gym_membership(uid)
+        if existing_gym:
+            return jsonify({
+                "status": "error",
+                "error": "You are already in a gym. Leave it before creating another.",
+                "gym": existing_gym,
+            }), 409
+
+        base_slug = clean_gym_slug(name)
+        slug = base_slug
+
+        for i in range(0, 20):
+            test_slug = base_slug if i == 0 else f"{base_slug}-{i + 1}"
+            exists = (
+                supabase.table("gyms")
+                .select("id")
+                .eq("slug", test_slug)
+                .limit(1)
+                .execute()
+            )
+            if not exists.data:
+                slug = test_slug
+                break
+
+        gym_payload = {
+            "owner_id": uid,
+            "name": name,
+            "slug": slug,
+            "description": description,
+            "visibility": visibility,
+            "badge_url": "assets/gyms/default-gym-badge.png",
+            "banner_url": "assets/gyms/default-gym-banner.jpg",
+            "member_count": 1,
+            "created_at": utc_now_iso(),
+            "updated_at": utc_now_iso(),
+        }
+
+        gym_res = supabase.table("gyms").insert(gym_payload).execute()
+
+        if not gym_res.data:
+            return jsonify({
+                "status": "error",
+                "error": "Gym creation failed.",
+            }), 500
+
+        gym_row = gym_res.data[0]
+        gym_id = gym_row.get("id")
+
+        supabase.table("gym_members").insert({
+            "gym_id": gym_id,
+            "user_id": uid,
+            "role": "owner",
+            "joined_at": utc_now_iso(),
+        }).execute()
+
+        supabase.table("gym_posts").insert({
+            "gym_id": gym_id,
+            "user_id": uid,
+            "kind": "system",
+            "body": f"{name} was created.",
+        }).execute()
+
+        return jsonify({
+            "status": "ok",
+            "gym": normalize_gym(gym_row, membership={"role": "owner", "joined_at": utc_now_iso()}),
+        }), 201
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not create gym.",
+            "details": str(e),
+        }), 500
+
+
+@app.route("/gyms/<gym_id>/join", methods=["POST"])
+def join_gym(gym_id):
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    gym_id = str(gym_id or "").strip()
+
+    try:
+        existing_gym, _ = get_my_gym_membership(uid)
+        if existing_gym:
+            return jsonify({
+                "status": "error",
+                "error": "You are already in a gym. Leave it before joining another.",
+                "gym": existing_gym,
+            }), 409
+
+        gym_res = (
+            supabase.table("gyms")
+            .select("*")
+            .eq("id", gym_id)
+            .limit(1)
+            .execute()
+        )
+
+        if not gym_res.data:
+            return jsonify({
+                "status": "error",
+                "error": "Gym not found.",
+            }), 404
+
+        gym_row = gym_res.data[0]
+
+        if str(gym_row.get("visibility") or "public").lower() != "public":
+            return jsonify({
+                "status": "error",
+                "error": "This gym is private.",
+            }), 403
+
+        supabase.table("gym_members").insert({
+            "gym_id": gym_id,
+            "user_id": uid,
+            "role": "member",
+            "joined_at": utc_now_iso(),
+        }).execute()
+
+        refresh_gym_member_count(gym_id)
+
+        profile = ensure_profile_row(uid)
+        display = profile_display_name(profile)
+
+        supabase.table("gym_posts").insert({
+            "gym_id": gym_id,
+            "user_id": uid,
+            "kind": "system",
+            "body": f"{display} joined the gym.",
+        }).execute()
+
+        gym, membership = get_my_gym_membership(uid)
+
+        return jsonify({
+            "status": "ok",
+            "gym": gym,
+            "membership": membership,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not join gym.",
+            "details": str(e),
+        }), 500
+
+
+@app.route("/gyms/<gym_id>/leave", methods=["POST"])
+def leave_gym(gym_id):
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    gym_id = str(gym_id or "").strip()
+
+    try:
+        mem_res = (
+            supabase.table("gym_members")
+            .select("gym_id,user_id,role")
+            .eq("gym_id", gym_id)
+            .eq("user_id", uid)
+            .limit(1)
+            .execute()
+        )
+
+        if not mem_res.data:
+            return jsonify({
+                "status": "error",
+                "error": "You are not in this gym.",
+            }), 404
+
+        role = str(mem_res.data[0].get("role") or "member").lower()
+
+        if role == "owner":
+            other_members = (
+                supabase.table("gym_members")
+                .select("user_id")
+                .eq("gym_id", gym_id)
+                .neq("user_id", uid)
+                .limit(1)
+                .execute()
+            )
+
+            if other_members.data:
+                return jsonify({
+                    "status": "error",
+                    "error": "Owner cannot leave while other members remain. Transfer ownership later, or remove members first.",
+                }), 409
+
+        supabase.table("gym_members").delete().eq("gym_id", gym_id).eq("user_id", uid).execute()
+        remaining = refresh_gym_member_count(gym_id)
+
+        if remaining <= 0:
+            supabase.table("gyms").delete().eq("id", gym_id).execute()
+
+        return jsonify({
+            "status": "ok",
+            "left": True,
+            "deleted_gym": remaining <= 0,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not leave gym.",
+            "details": str(e),
+        }), 500
+
+
+@app.route("/gyms/<gym_id>/members", methods=["GET"])
+def gym_members(gym_id):
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    gym_id = str(gym_id or "").strip()
+
+    if not user_is_gym_member(gym_id, uid):
+        return jsonify({
+            "status": "error",
+            "error": "You must be a member to view members.",
+        }), 403
+
+    return jsonify({
+        "status": "ok",
+        "items": load_gym_members(gym_id),
+    }), 200
+
+
+@app.route("/gyms/<gym_id>/posts", methods=["GET", "POST"])
+def gym_posts(gym_id):
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    gym_id = str(gym_id or "").strip()
+
+    if not user_is_gym_member(gym_id, uid):
+        return jsonify({
+            "status": "error",
+            "error": "You must be a member to use this gym feed.",
+        }), 403
+
+    if request.method == "POST":
+        data = request.get_json(force=True, silent=True) or {}
+        body = str(data.get("body") or "").strip()
+
+        if not body:
+            return jsonify({
+                "status": "error",
+                "error": "Message cannot be empty.",
+            }), 400
+
+        if len(body) > 500:
+            return jsonify({
+                "status": "error",
+                "error": "Message must be 500 characters or less.",
+            }), 400
+
+        try:
+            supabase.table("gym_posts").insert({
+                "gym_id": gym_id,
+                "user_id": uid,
+                "kind": "message",
+                "body": body,
+            }).execute()
+
+            return jsonify({
+                "status": "ok",
+                "items": load_gym_posts(gym_id, uid),
+            }), 201
+
+        except Exception as e:
+            return jsonify({
+                "status": "error",
+                "error": "Could not post message.",
+                "details": str(e),
+            }), 500
+
+    try:
+        return jsonify({
+            "status": "ok",
+            "items": load_gym_posts(gym_id, uid),
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not load gym posts.",
+            "details": str(e),
+        }), 500
+
+
+@app.route("/gyms/<gym_id>/share-session", methods=["POST"])
+def share_session_to_gym(gym_id):
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    gym_id = str(gym_id or "").strip()
+
+    if not user_is_gym_member(gym_id, uid):
+        return jsonify({
+            "status": "error",
+            "error": "You must be a member to share to this gym.",
+        }), 403
+
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        session_post_id = str(data.get("session_post_id") or "").strip()
+
+        if not session_post_id:
+            latest = (
+                supabase.table("session_posts")
+                .select("*")
+                .eq("user_id", uid)
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+
+            if not latest.data:
+                return jsonify({
+                    "status": "error",
+                    "error": "No session post found to share.",
+                }), 404
+
+            session_post_id = str(latest.data[0].get("id") or "")
+
+        post_res = (
+            supabase.table("session_posts")
+            .select("*")
+            .eq("id", session_post_id)
+            .eq("user_id", uid)
+            .limit(1)
+            .execute()
+        )
+
+        if not post_res.data:
+            return jsonify({
+                "status": "error",
+                "error": "Session post not found.",
+            }), 404
+
+        existing = (
+            supabase.table("gym_posts")
+            .select("id")
+            .eq("gym_id", gym_id)
+            .eq("session_post_id", session_post_id)
+            .limit(1)
+            .execute()
+        )
+
+        if not existing.data:
+            title = post_res.data[0].get("title") or "Completed a Corner class."
+            supabase.table("gym_posts").insert({
+                "gym_id": gym_id,
+                "user_id": uid,
+                "kind": "session",
+                "body": title,
+                "session_post_id": session_post_id,
+            }).execute()
+
+        return jsonify({
+            "status": "ok",
+            "items": load_gym_posts(gym_id, uid),
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not share session to gym.",
+            "details": str(e),
+        }), 500
 
 @app.route("/search/users", methods=["GET"])
 def search_users():
