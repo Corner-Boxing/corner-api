@@ -1877,8 +1877,8 @@ def create_notification(
 
         payload = {k: v for k, v in payload.items() if v is not None}
         supabase.table("notifications").insert(payload).execute()
-    except Exception:
-        # Notifications should never break the main action.
+    except Exception as e:
+        print("[create_notification] failed:", str(e))
         pass
 
 
