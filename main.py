@@ -1185,6 +1185,26 @@ def home_feed():
             "details": str(e),
         }), 500
 
+@app.route("/home/notifications/test", methods=["POST"])
+def create_test_notification():
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    result = create_notification(
+        uid,
+        None,
+        "test",
+        "Test notification",
+        "If you can see this, notification creation is working.",
+        "notification",
+        None,
+    )
+
+    return jsonify({
+        "status": "ok" if result.get("ok") else "error",
+        "result": result,
+    }), 200 if result.get("ok") else 500
 
 @app.route("/home/notifications", methods=["GET"])
 def home_notifications():
@@ -1847,6 +1867,16 @@ def safe_comment(row: dict | None, profiles_by_id: dict, viewer_id: str | None):
         "is_owner": bool(viewer_id and author_id and viewer_id == author_id),
     }
 
+def clean_notification_uuid(value):
+    raw = str(value or "").strip()
+    if re.fullmatch(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        raw,
+    ):
+        return raw
+    return None
+
+
 def create_notification(
     user_id: str | None,
     actor_id: str | None,
@@ -1857,29 +1887,89 @@ def create_notification(
     entity_id: str | None = None,
 ):
     if not user_id:
-        return
+        return {
+            "ok": False,
+            "error": "missing_user_id",
+        }
 
     # Do not notify yourself. It feels broken and noisy.
     if actor_id and str(user_id) == str(actor_id):
-        return
-
-    try:
-        payload = {
-            "user_id": str(user_id),
-            "actor_id": str(actor_id) if actor_id else None,
-            "type": str(type_ or "notification"),
-            "title": str(title or "Notification")[:120],
-            "body": str(body or "")[:500],
-            "entity_type": entity_type,
-            "entity_id": str(entity_id) if entity_id else None,
-            "read": False,
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "self_notification",
         }
 
-        payload = {k: v for k, v in payload.items() if v is not None}
-        supabase.table("notifications").insert(payload).execute()
-    except Exception as e:
-        print("[create_notification] failed:", str(e))
-        pass
+    base_payload = {
+        "user_id": str(user_id),
+        "actor_id": str(actor_id) if actor_id else None,
+        "type": str(type_ or "notification")[:80],
+        "title": str(title or "Notification")[:120],
+        "body": str(body or "")[:500],
+        "entity_type": str(entity_type)[:80] if entity_type else None,
+    }
+
+    clean_entity_id = clean_notification_uuid(entity_id)
+    if clean_entity_id:
+        base_payload["entity_id"] = clean_entity_id
+
+    base_payload = {k: v for k, v in base_payload.items() if v is not None}
+
+    # Try a few safe variants because earlier versions may have had slightly different schemas.
+    payload_attempts = [
+        {**base_payload, "read": False},
+        {**base_payload, "is_read": False},
+        base_payload,
+    ]
+
+    last_error = None
+
+    for payload in payload_attempts:
+        try:
+            res = supabase.table("notifications").insert(payload).execute()
+            err_msg = supa_err(res)
+
+            if err_msg:
+                last_error = err_msg
+                print("[create_notification] insert response error:", err_msg, "payload_keys=", list(payload.keys()))
+                continue
+
+            if getattr(res, "data", None):
+                print("[create_notification] created:", res.data[0])
+                return {
+                    "ok": True,
+                    "notification": res.data[0],
+                }
+
+            # Some Supabase responses can succeed but return no rows.
+            verify = (
+                supabase.table("notifications")
+                .select("*")
+                .eq("user_id", str(user_id))
+                .eq("type", str(type_ or "notification")[:80])
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+
+            if verify.data:
+                print("[create_notification] created verified:", verify.data[0])
+                return {
+                    "ok": True,
+                    "notification": verify.data[0],
+                }
+
+            last_error = "insert_returned_no_data"
+            print("[create_notification] no data after insert payload_keys=", list(payload.keys()))
+
+        except Exception as e:
+            last_error = str(e)
+            print("[create_notification] failed:", str(e), "payload_keys=", list(payload.keys()))
+
+    return {
+        "ok": False,
+        "error": last_error or "notification_insert_failed",
+    }
 
 
 def notify_gym_members(
