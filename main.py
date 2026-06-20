@@ -104,7 +104,7 @@ def ensure_profile_row(user_id: str):
 
     res = (
         supabase.table("profiles")
-        .select("id,username,display_name,bio,avatar_url,plan_tier,subscription_status,tier_updated_at,created_at,updated_at")
+        .select("id,username,display_name,bio,avatar_url,account_privacy,plan_tier,subscription_status,tier_updated_at,created_at,updated_at")
         .eq("id", user_id)
         .limit(1)
         .execute()
@@ -119,6 +119,7 @@ def ensure_profile_row(user_id: str):
         "display_name": None,
         "bio": "",
         "avatar_url": "assets/avatars/default-avatar-head.png",
+        "account_privacy": "public",
         "plan_tier": "free",
         "created_at": utc_now_iso(),
         "updated_at": utc_now_iso(),
@@ -131,7 +132,7 @@ def ensure_profile_row(user_id: str):
     # Race-condition fallback: if another request created it first, read again.
     retry = (
         supabase.table("profiles")
-        .select("id,username,display_name,bio,avatar_url,plan_tier,subscription_status,tier_updated_at,created_at,updated_at")
+        .select("id,username,display_name,bio,avatar_url,account_privacy,plan_tier,subscription_status,tier_updated_at,created_at,updated_at")
         .eq("id", user_id)
         .limit(1)
         .execute()
@@ -285,6 +286,10 @@ def update_my_profile():
     bio = str(data.get("bio") or "").strip()
     avatar_url = str(data.get("avatar_url") or "").strip()
 
+    account_privacy = str(data.get("account_privacy") or "public").strip().lower()
+    if account_privacy not in ("public", "private"):
+        account_privacy = "public"
+
     if not display_name or len(display_name) > 40:
         return jsonify({
             "status": "error",
@@ -341,6 +346,7 @@ def update_my_profile():
         "display_name": display_name,
         "bio": bio,
         "avatar_url": avatar_url,
+        "account_privacy": account_privacy,
         "updated_at": utc_now_iso(),
     }
 
@@ -358,7 +364,7 @@ def update_my_profile():
 
     return jsonify({
         "status": "ok",
-        "profile": normalize_profile(saved),
+        "profile": profile_payload(saved, uid),
         "profile_complete": profile_is_complete(saved),
     }), 200
 
@@ -540,6 +546,10 @@ def normalize_profile(row: dict | None):
     row = row or {}
     username = (row.get("username") or "").strip()
     display_name = (row.get("display_name") or "").strip()
+    account_privacy = str(row.get("account_privacy") or "public").strip().lower()
+
+    if account_privacy not in ("public", "private"):
+        account_privacy = "public"
 
     return {
         "id": row.get("id"),
@@ -547,6 +557,7 @@ def normalize_profile(row: dict | None):
         "display_name": display_name or username or "Corner athlete",
         "bio": row.get("bio") or "",
         "avatar_url": row.get("avatar_url") or "assets/avatars/default-avatar-head.png",
+        "account_privacy": account_privacy,
     }
 
 
@@ -558,7 +569,7 @@ def load_profiles_map(user_ids: list[str]):
     try:
         res = (
             supabase.table("profiles")
-            .select("id,username,display_name,bio,avatar_url")
+            .select("id,username,display_name,bio,avatar_url,account_privacy")
             .in_("id", clean_ids)
             .execute()
         )
@@ -1293,7 +1304,7 @@ def home_suggestions():
 
         res = (
             supabase.table("profiles")
-            .select("id,username,display_name,bio,avatar_url")
+            .select("id,username,display_name,bio,avatar_url,account_privacy")
             .neq("id", uid)
             .limit(60)
             .execute()
@@ -1428,6 +1439,33 @@ def profile_posts(profile_id):
     try:
         following_ids = load_following_ids(viewer_id) if viewer_id else set()
         is_self = bool(viewer_id and viewer_id == profile_id)
+        is_following_profile = bool(profile_id in following_ids)
+
+        profile_res = (
+            supabase.table("profiles")
+            .select("id,username,display_name,bio,avatar_url,account_privacy")
+            .eq("id", profile_id)
+            .limit(1)
+            .execute()
+        )
+
+        if not profile_res.data:
+            return jsonify({
+                "status": "error",
+                "error": "Profile not found.",
+            }), 404
+
+        profile_row = profile_res.data[0]
+        account_privacy = str(profile_row.get("account_privacy") or "public").lower()
+
+        if account_privacy == "private" and not is_self and not is_following_profile:
+            return jsonify({
+                "status": "locked",
+                "error": "This account is private. Follow this athlete to view their class posts.",
+                "items": [],
+                "locked": True,
+                "profile": profile_payload(profile_row, viewer_id),
+            }), 403
 
         posts_res = (
             supabase.table("session_posts")
@@ -1449,17 +1487,19 @@ def profile_posts(profile_id):
                 can_see = True
             elif visibility == "public":
                 can_see = True
-            elif visibility in ("friends", "friends_only", "followers", "followers_only") and profile_id in following_ids:
+            elif visibility in ("friends", "friends_only", "followers", "followers_only") and is_following_profile:
                 can_see = True
 
             if can_see:
                 visible.append(row)
 
-        profiles_by_id = load_profiles_map([profile_id])
+        profiles_by_id = {profile_id: normalize_profile(profile_row)}
 
         return jsonify({
             "status": "ok",
             "items": [safe_session_post(row, profiles_by_id, viewer_id=viewer_id) for row in visible],
+            "locked": False,
+            "profile": profile_payload(profile_row, viewer_id),
         }), 200
 
     except Exception as e:
@@ -2347,6 +2387,145 @@ def create_gym():
             "details": str(e),
         }), 500
 
+def get_gym_role(gym_id: str, user_id: str):
+    if not gym_id or not user_id:
+        return None
+
+    try:
+        res = (
+            supabase.table("gym_members")
+            .select("role")
+            .eq("gym_id", gym_id)
+            .eq("user_id", user_id)
+            .limit(1)
+            .execute()
+        )
+
+        if not res.data:
+            return None
+
+        return str(res.data[0].get("role") or "member").lower()
+    except Exception:
+        return None
+
+
+@app.route("/gyms/<gym_id>", methods=["PATCH"])
+def update_gym(gym_id):
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    gym_id = str(gym_id or "").strip()
+    role = get_gym_role(gym_id, uid)
+
+    if role not in ("owner", "admin"):
+        return jsonify({
+            "status": "error",
+            "error": "Only a gym owner or admin can edit this gym.",
+        }), 403
+
+    data = request.get_json(force=True, silent=True) or {}
+
+    name = str(data.get("name") or "").strip()
+    description = str(data.get("description") or "").strip()
+    visibility = str(data.get("visibility") or "public").strip().lower()
+
+    if not name or len(name) > 40:
+        return jsonify({
+            "status": "error",
+            "error": "Gym name must be 1-40 characters.",
+        }), 400
+
+    if len(description) > 240:
+        return jsonify({
+            "status": "error",
+            "error": "Gym description must be 240 characters or less.",
+        }), 400
+
+    if visibility not in ("public", "private"):
+        visibility = "public"
+
+    try:
+        update_res = (
+            supabase.table("gyms")
+            .update({
+                "name": name,
+                "description": description,
+                "visibility": visibility,
+                "updated_at": utc_now_iso(),
+            })
+            .eq("id", gym_id)
+            .execute()
+        )
+
+        err_msg = supa_err(update_res)
+        if err_msg:
+            return jsonify({
+                "status": "error",
+                "error": "Gym update failed.",
+                "details": err_msg,
+            }), 500
+
+        gym_res = (
+            supabase.table("gyms")
+            .select("*")
+            .eq("id", gym_id)
+            .limit(1)
+            .execute()
+        )
+
+        membership = {
+            "gym_id": gym_id,
+            "user_id": uid,
+            "role": role,
+            "joined_at": None,
+        }
+
+        gym = normalize_gym(gym_res.data[0], membership=membership) if gym_res.data else None
+
+        return jsonify({
+            "status": "ok",
+            "gym": gym,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not update gym.",
+            "details": str(e),
+        }), 500
+
+
+@app.route("/gyms/<gym_id>", methods=["DELETE"])
+def delete_gym(gym_id):
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    gym_id = str(gym_id or "").strip()
+    role = get_gym_role(gym_id, uid)
+
+    if role != "owner":
+        return jsonify({
+            "status": "error",
+            "error": "Only the gym owner can delete this gym.",
+        }), 403
+
+    try:
+        supabase.table("gyms").delete().eq("id", gym_id).execute()
+
+        return jsonify({
+            "status": "ok",
+            "deleted": True,
+            "gym_id": gym_id,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not delete gym.",
+            "details": str(e),
+        }), 500
 
 @app.route("/gyms/<gym_id>/join", methods=["POST"])
 def join_gym(gym_id):
@@ -2851,7 +3030,7 @@ def search_users():
 
         res = (
             supabase.table("profiles")
-            .select("id,username,display_name,bio,avatar_url")
+            .select("id,username,display_name,bio,avatar_url,account_privacy")
             .limit(100)
             .execute()
         )
@@ -2912,7 +3091,7 @@ def read_profile_by_username(username):
     try:
         res = (
             supabase.table("profiles")
-            .select("id,username,display_name,bio,avatar_url,created_at,plan_tier")
+            .select("id,username,display_name,bio,avatar_url,account_privacy,created_at,plan_tier")
             .eq("username", username)
             .limit(1)
             .execute()
@@ -3036,7 +3215,7 @@ def read_profile(profile_id):
     try:
         res = (
             supabase.table("profiles")
-            .select("id,username,display_name,bio,avatar_url,created_at,plan_tier")
+            .select("id,username,display_name,bio,avatar_url,account_privacy,created_at,plan_tier")
             .eq("id", profile_id)
             .limit(1)
             .execute()
