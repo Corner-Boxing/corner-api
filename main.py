@@ -603,6 +603,42 @@ def load_follower_ids(user_id: str):
         return set()
 
 
+def load_pending_follow_request_ids(requester_id: str | None):
+    if not requester_id:
+        return set()
+
+    try:
+        res = (
+            supabase.table("follow_requests")
+            .select("target_id")
+            .eq("requester_id", requester_id)
+            .eq("status", "pending")
+            .execute()
+        )
+        return {str(row.get("target_id")) for row in (res.data or []) if row.get("target_id")}
+    except Exception:
+        return set()
+
+
+def get_pending_follow_request(requester_id: str, target_id: str):
+    if not requester_id or not target_id:
+        return None
+
+    try:
+        res = (
+            supabase.table("follow_requests")
+            .select("*")
+            .eq("requester_id", requester_id)
+            .eq("target_id", target_id)
+            .eq("status", "pending")
+            .limit(1)
+            .execute()
+        )
+        return res.data[0] if res.data else None
+    except Exception:
+        return None
+
+
 def count_followers(user_id: str):
     try:
         res = (
@@ -710,13 +746,16 @@ def profile_payload(profile: dict | None, viewer_id: str | None = None):
 
     profile_id = str(clean.get("id") or "")
     following = False
+    follow_requested = False
     is_self = bool(viewer_id and profile_id and viewer_id == profile_id)
 
     if viewer_id and profile_id and not is_self:
         following = profile_id in load_following_ids(viewer_id)
+        follow_requested = profile_id in load_pending_follow_request_ids(viewer_id)
 
     clean["is_self"] = is_self
     clean["following"] = following
+    clean["follow_requested"] = follow_requested
     clean["followers_count"] = count_followers(profile_id) if profile_id else 0
     clean["following_count"] = count_following(profile_id) if profile_id else 0
     clean["primary_gym"] = get_user_primary_gym(profile_id) if profile_id else None
@@ -1196,27 +1235,6 @@ def home_feed():
             "details": str(e),
         }), 500
 
-@app.route("/home/notifications/test", methods=["POST"])
-def create_test_notification():
-    uid, err = require_user_id()
-    if err:
-        return err
-
-    result = create_notification(
-        uid,
-        None,
-        "test",
-        "Test notification",
-        "If you can see this, notification creation is working.",
-        "notification",
-        None,
-    )
-
-    return jsonify({
-        "status": "ok" if result.get("ok") else "error",
-        "result": result,
-    }), 200 if result.get("ok") else 500
-
 @app.route("/home/notifications", methods=["GET"])
 def home_notifications():
     uid, err = require_user_id()
@@ -1369,11 +1387,24 @@ def follow_user(target_user_id):
     try:
         if request.method == "DELETE":
             supabase.table("follows").delete().eq("follower_id", uid).eq("following_id", target_user_id).execute()
+            try:
+                supabase.table("follow_requests").delete().eq("requester_id", uid).eq("target_id", target_user_id).eq("status", "pending").execute()
+            except Exception:
+                pass
+
             return jsonify({
                 "status": "ok",
                 "following": False,
+                "requested": False,
                 "target_user_id": target_user_id,
             }), 200
+
+        target_profile = ensure_profile_row(target_user_id)
+        if not target_profile:
+            return jsonify({
+                "status": "error",
+                "error": "Profile not found.",
+            }), 404
 
         existing = (
             supabase.table("follows")
@@ -1384,36 +1415,87 @@ def follow_user(target_user_id):
             .execute()
         )
 
-        if not existing.data:
-            insert_res = supabase.table("follows").insert({
-                "follower_id": uid,
-                "following_id": target_user_id,
-            }).execute()
+        if existing.data:
+            return jsonify({
+                "status": "ok",
+                "following": True,
+                "requested": False,
+                "target_user_id": target_user_id,
+            }), 200
 
-            insert_err = supa_err(insert_res)
-            if insert_err:
-                return jsonify({
-                    "status": "error",
-                    "error": "Follow insert failed.",
-                    "details": insert_err,
-                }), 500
+        actor_profile = ensure_profile_row(uid)
+        actor_name = profile_display_name(actor_profile)
+        target_privacy = str(target_profile.get("account_privacy") or "public").lower()
 
-            actor_profile = ensure_profile_row(uid)
-            actor_name = profile_display_name(actor_profile)
+        if target_privacy == "private":
+            pending = get_pending_follow_request(uid, target_user_id)
 
-            create_notification(
-                target_user_id,
-                uid,
-                "follow",
-                f"{actor_name} followed you.",
-                "You have a new follower on Corner.",
-                "profile",
-                uid,
-            )
+            if not pending:
+                req_res = supabase.table("follow_requests").insert({
+                    "requester_id": uid,
+                    "target_id": target_user_id,
+                    "status": "pending",
+                    "created_at": utc_now_iso(),
+                    "updated_at": utc_now_iso(),
+                }).execute()
+
+                req_err = supa_err(req_res)
+                if req_err:
+                    return jsonify({
+                        "status": "error",
+                        "error": "Follow request failed.",
+                        "details": req_err,
+                    }), 500
+
+                create_notification(
+                    target_user_id,
+                    uid,
+                    "follow_request",
+                    f"{actor_name} requested to follow you.",
+                    "Approve the request from Profile → People → Requests.",
+                    "profile",
+                    uid,
+                )
+
+            return jsonify({
+                "status": "ok",
+                "following": False,
+                "requested": True,
+                "target_user_id": target_user_id,
+            }), 200
+
+        insert_res = supabase.table("follows").insert({
+            "follower_id": uid,
+            "following_id": target_user_id,
+        }).execute()
+
+        insert_err = supa_err(insert_res)
+        if insert_err:
+            return jsonify({
+                "status": "error",
+                "error": "Follow insert failed.",
+                "details": insert_err,
+            }), 500
+
+        try:
+            supabase.table("follow_requests").delete().eq("requester_id", uid).eq("target_id", target_user_id).execute()
+        except Exception:
+            pass
+
+        create_notification(
+            target_user_id,
+            uid,
+            "follow",
+            f"{actor_name} followed you.",
+            "You have a new follower on Corner.",
+            "profile",
+            uid,
+        )
 
         return jsonify({
             "status": "ok",
             "following": True,
+            "requested": False,
             "target_user_id": target_user_id,
         }), 200
 
@@ -1421,6 +1503,173 @@ def follow_user(target_user_id):
         return jsonify({
             "status": "error",
             "error": "Could not update follow state.",
+            "details": str(e),
+        }), 500
+
+
+@app.route("/follow-requests", methods=["GET"])
+def my_follow_requests():
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    try:
+        req_res = (
+            supabase.table("follow_requests")
+            .select("*")
+            .eq("target_id", uid)
+            .eq("status", "pending")
+            .order("created_at", desc=True)
+            .limit(100)
+            .execute()
+        )
+
+        rows = req_res.data or []
+        requester_ids = [str(row.get("requester_id")) for row in rows if row.get("requester_id")]
+        profiles_by_id = load_profiles_map(requester_ids)
+
+        items = []
+        for row in rows:
+            requester_id = str(row.get("requester_id") or "")
+            profile = profiles_by_id.get(requester_id) or normalize_profile({"id": requester_id})
+            profile["following"] = requester_id in load_following_ids(uid)
+            profile["is_self"] = False
+
+            items.append({
+                "id": row.get("id"),
+                "created_at": row.get("created_at"),
+                "profile": profile,
+                "reason": "Requested to follow you",
+            })
+
+        return jsonify({
+            "status": "ok",
+            "items": items,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not load follow requests.",
+            "details": str(e),
+        }), 500
+
+
+@app.route("/follow-requests/<request_id>/accept", methods=["POST"])
+def accept_follow_request(request_id):
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    request_id = str(request_id or "").strip()
+
+    try:
+        req_res = (
+            supabase.table("follow_requests")
+            .select("*")
+            .eq("id", request_id)
+            .eq("target_id", uid)
+            .eq("status", "pending")
+            .limit(1)
+            .execute()
+        )
+
+        if not req_res.data:
+            return jsonify({
+                "status": "error",
+                "error": "Follow request not found.",
+            }), 404
+
+        row = req_res.data[0]
+        requester_id = str(row.get("requester_id") or "")
+
+        existing = (
+            supabase.table("follows")
+            .select("follower_id,following_id")
+            .eq("follower_id", requester_id)
+            .eq("following_id", uid)
+            .limit(1)
+            .execute()
+        )
+
+        if not existing.data:
+            supabase.table("follows").insert({
+                "follower_id": requester_id,
+                "following_id": uid,
+            }).execute()
+
+        supabase.table("follow_requests").update({
+            "status": "accepted",
+            "updated_at": utc_now_iso(),
+        }).eq("id", request_id).execute()
+
+        target_profile = ensure_profile_row(uid)
+        target_name = profile_display_name(target_profile)
+
+        create_notification(
+            requester_id,
+            uid,
+            "follow_request_accepted",
+            f"{target_name} approved your follow request.",
+            "You can now view their followers-only class posts.",
+            "profile",
+            uid,
+        )
+
+        return jsonify({
+            "status": "ok",
+            "accepted": True,
+            "request_id": request_id,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not accept follow request.",
+            "details": str(e),
+        }), 500
+
+
+@app.route("/follow-requests/<request_id>/decline", methods=["POST"])
+def decline_follow_request(request_id):
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    request_id = str(request_id or "").strip()
+
+    try:
+        req_res = (
+            supabase.table("follow_requests")
+            .select("*")
+            .eq("id", request_id)
+            .eq("target_id", uid)
+            .eq("status", "pending")
+            .limit(1)
+            .execute()
+        )
+
+        if not req_res.data:
+            return jsonify({
+                "status": "error",
+                "error": "Follow request not found.",
+            }), 404
+
+        supabase.table("follow_requests").update({
+            "status": "declined",
+            "updated_at": utc_now_iso(),
+        }).eq("id", request_id).execute()
+
+        return jsonify({
+            "status": "ok",
+            "declined": True,
+            "request_id": request_id,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not decline follow request.",
             "details": str(e),
         }), 500
 
@@ -2672,6 +2921,80 @@ def leave_gym(gym_id):
             "details": str(e),
         }), 500
 
+@app.route("/gyms/<gym_id>/members/<member_user_id>", methods=["DELETE"])
+def remove_gym_member(gym_id, member_user_id):
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    gym_id = str(gym_id or "").strip()
+    member_user_id = str(member_user_id or "").strip()
+    role = get_gym_role(gym_id, uid)
+
+    if role not in ("owner", "admin"):
+        return jsonify({
+            "status": "error",
+            "error": "Only a gym owner or admin can remove members.",
+        }), 403
+
+    if member_user_id == uid:
+        return jsonify({
+            "status": "error",
+            "error": "Use Leave Gym instead of removing yourself.",
+        }), 400
+
+    target_role = get_gym_role(gym_id, member_user_id)
+
+    if target_role == "owner":
+        return jsonify({
+            "status": "error",
+            "error": "The gym owner cannot be removed.",
+        }), 403
+
+    if role == "admin" and target_role == "admin":
+        return jsonify({
+            "status": "error",
+            "error": "Admins cannot remove other admins.",
+        }), 403
+
+    try:
+        member_profile = ensure_profile_row(member_user_id)
+        member_name = profile_display_name(member_profile)
+
+        supabase.table("gym_members").delete().eq("gym_id", gym_id).eq("user_id", member_user_id).execute()
+        remaining = refresh_gym_member_count(gym_id)
+
+        supabase.table("gym_posts").insert({
+            "gym_id": gym_id,
+            "user_id": uid,
+            "kind": "system",
+            "body": f"{member_name} was removed from the gym.",
+        }).execute()
+
+        create_notification(
+            member_user_id,
+            uid,
+            "gym_removed",
+            "You were removed from a gym.",
+            "A gym owner or admin removed you from the gym.",
+            "gym",
+            gym_id,
+        )
+
+        return jsonify({
+            "status": "ok",
+            "removed": True,
+            "member_user_id": member_user_id,
+            "member_count": remaining,
+            "members": load_gym_members(gym_id),
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not remove gym member.",
+            "details": str(e),
+        }), 500
 
 @app.route("/gyms/<gym_id>/members", methods=["GET"])
 def gym_members(gym_id):
