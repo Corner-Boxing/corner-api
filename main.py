@@ -2041,6 +2041,47 @@ def like_session_post(post_id):
         }), 500
 
 
+def build_comment_tree(comments: list[dict], profiles_by_id: dict, viewer_id: str | None):
+    by_parent = {}
+
+    for comment in comments or []:
+        parent_id = str(comment.get("parent_comment_id") or "")
+        by_parent.setdefault(parent_id, []).append(comment)
+
+    for key in by_parent:
+        by_parent[key].sort(key=lambda row: str(row.get("created_at") or ""), reverse=True)
+
+    def serialize(row):
+        item = safe_comment(row, profiles_by_id, viewer_id)
+        comment_id = str(row.get("id") or "")
+        item["replies"] = [serialize(child) for child in by_parent.get(comment_id, [])]
+        return item
+
+    return [serialize(row) for row in by_parent.get("", [])]
+
+
+def collect_comment_descendant_ids(comment_id: str):
+    found = []
+
+    def walk(parent_id):
+        try:
+            child_res = (
+                supabase.table("post_comments")
+                .select("id")
+                .eq("parent_comment_id", parent_id)
+                .execute()
+            )
+            for child in (child_res.data or []):
+                child_id = str(child.get("id") or "")
+                if child_id and child_id not in found:
+                    found.append(child_id)
+                    walk(child_id)
+        except Exception:
+            return
+
+    walk(comment_id)
+    return found
+
 @app.route("/session-post/<post_id>/comments", methods=["GET", "POST"])
 def session_post_comments(post_id):
     uid, err = require_user_id()
@@ -2065,6 +2106,7 @@ def session_post_comments(post_id):
     if request.method == "POST":
         data = request.get_json(force=True, silent=True) or {}
         body = str(data.get("body") or "").strip()
+        parent_comment_id = str(data.get("parent_comment_id") or "").strip() or None
 
         if not body:
             return jsonify({
@@ -2078,12 +2120,37 @@ def session_post_comments(post_id):
                 "error": "Comment must be 500 characters or less.",
             }), 400
 
+        parent_comment = None
+
+        if parent_comment_id:
+            parent_res = (
+                supabase.table("post_comments")
+                .select("*")
+                .eq("id", parent_comment_id)
+                .eq("post_id", post_id)
+                .limit(1)
+                .execute()
+            )
+
+            if not parent_res.data:
+                return jsonify({
+                    "status": "error",
+                    "error": "Parent comment not found.",
+                }), 404
+
+            parent_comment = parent_res.data[0]
+
         try:
-            insert_res = supabase.table("post_comments").insert({
+            payload = {
                 "post_id": post_id,
                 "user_id": uid,
                 "body": body,
-            }).execute()
+            }
+
+            if parent_comment_id:
+                payload["parent_comment_id"] = parent_comment_id
+
+            insert_res = supabase.table("post_comments").insert(payload).execute()
 
             update_post_counts(post_id)
 
@@ -2091,15 +2158,39 @@ def session_post_comments(post_id):
             actor_profile = ensure_profile_row(uid)
             actor_name = profile_display_name(actor_profile)
 
-            create_notification(
-                owner_id,
-                uid,
-                "comment",
-                f"{actor_name} commented on your session.",
-                body,
-                "session_post",
-                post_id,
-            )
+            if parent_comment:
+                parent_author_id = str(parent_comment.get("user_id") or "")
+
+                create_notification(
+                    parent_author_id,
+                    uid,
+                    "comment_reply",
+                    f"{actor_name} replied to your comment.",
+                    body,
+                    "session_post",
+                    post_id,
+                )
+
+                if owner_id and owner_id != uid and owner_id != parent_author_id:
+                    create_notification(
+                        owner_id,
+                        uid,
+                        "comment",
+                        f"{actor_name} replied on your session.",
+                        body,
+                        "session_post",
+                        post_id,
+                    )
+            else:
+                create_notification(
+                    owner_id,
+                    uid,
+                    "comment",
+                    f"{actor_name} commented on your session.",
+                    body,
+                    "session_post",
+                    post_id,
+                )
 
             comment = insert_res.data[0] if insert_res.data else None
             profiles_by_id = load_profiles_map([uid])
@@ -2122,8 +2213,8 @@ def session_post_comments(post_id):
             supabase.table("post_comments")
             .select("*")
             .eq("post_id", post_id)
-            .order("created_at", desc=False)
-            .limit(100)
+            .order("created_at", desc=True)
+            .limit(200)
             .execute()
         )
 
@@ -2133,7 +2224,7 @@ def session_post_comments(post_id):
 
         return jsonify({
             "status": "ok",
-            "items": [safe_comment(c, profiles_by_id, uid) for c in comments],
+            "items": build_comment_tree(comments, profiles_by_id, uid),
         }), 200
 
     except Exception as e:
@@ -2180,13 +2271,19 @@ def delete_session_comment(comment_id):
                 "error": "Forbidden.",
             }), 403
 
-        supabase.table("post_comments").delete().eq("id", comment_id).execute()
+        delete_ids = collect_comment_descendant_ids(comment_id)
+        delete_ids.append(comment_id)
+
+        for cid in delete_ids:
+            supabase.table("post_comments").delete().eq("id", cid).execute()
+
         update_post_counts(post_id)
 
         return jsonify({
             "status": "ok",
             "deleted": True,
             "comment_id": comment_id,
+            "deleted_ids": delete_ids,
             "comments_count": count_post_comments(post_id),
         }), 200
 
@@ -2208,11 +2305,13 @@ def safe_comment(row: dict | None, profiles_by_id: dict, viewer_id: str | None):
     return {
         "id": row.get("id"),
         "post_id": row.get("post_id"),
+        "parent_comment_id": row.get("parent_comment_id"),
         "body": row.get("body") or "",
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
         "author": author,
         "is_owner": bool(viewer_id and author_id and viewer_id == author_id),
+        "replies": [],
     }
 
 def clean_notification_uuid(value):
