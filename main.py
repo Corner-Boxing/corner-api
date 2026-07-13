@@ -1311,6 +1311,30 @@ def mark_notification_read(notification_id):
             "details": str(e),
         }), 500
 
+@app.route("/home/notifications/<notification_id>", methods=["DELETE"])
+def delete_notification(notification_id):
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    notification_id = str(notification_id or "").strip()
+
+    try:
+        supabase.table("notifications").delete().eq("id", notification_id).eq("user_id", uid).execute()
+
+        return jsonify({
+            "status": "ok",
+            "notification_id": notification_id,
+            "deleted": True,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not delete notification.",
+            "details": str(e),
+        }), 500
+
 @app.route("/home/suggestions", methods=["GET"])
 def home_suggestions():
     uid, err = require_user_id()
@@ -1319,6 +1343,7 @@ def home_suggestions():
 
     try:
         following_ids = load_following_ids(uid)
+        requested_ids = load_pending_follow_request_ids(uid)
 
         res = (
             supabase.table("profiles")
@@ -1329,6 +1354,7 @@ def home_suggestions():
         )
 
         following_items = []
+        requested_items = []
         suggestion_items = []
 
         for row in (res.data or []):
@@ -1337,19 +1363,28 @@ def home_suggestions():
                 continue
 
             already_following = profile_id in following_ids
+            requested = profile_id in requested_ids
+
+            profile = normalize_profile(row)
+            profile["following"] = already_following
+            profile["follow_requested"] = requested
+            profile["is_self"] = False
 
             item = {
-                "profile": normalize_profile(row),
-                "reason": "Following" if already_following else "Corner athlete",
+                "profile": profile,
+                "reason": "Following" if already_following else ("Requested" if requested else "Corner athlete"),
                 "already_following": already_following,
+                "requested": requested,
             }
 
             if already_following:
                 following_items.append(item)
+            elif requested:
+                requested_items.append(item)
             else:
                 suggestion_items.append(item)
 
-        items = following_items[:12] + suggestion_items[:12]
+        items = following_items[:12] + requested_items[:12] + suggestion_items[:12]
 
         return jsonify({
             "status": "ok",
@@ -1387,8 +1422,14 @@ def follow_user(target_user_id):
     try:
         if request.method == "DELETE":
             supabase.table("follows").delete().eq("follower_id", uid).eq("following_id", target_user_id).execute()
+
             try:
                 supabase.table("follow_requests").delete().eq("requester_id", uid).eq("target_id", target_user_id).eq("status", "pending").execute()
+            except Exception:
+                pass
+
+            try:
+                supabase.table("notifications").delete().eq("user_id", target_user_id).eq("actor_id", uid).eq("type", "follow_request").execute()
             except Exception:
                 pass
 
@@ -1479,6 +1520,11 @@ def follow_user(target_user_id):
 
         try:
             supabase.table("follow_requests").delete().eq("requester_id", uid).eq("target_id", target_user_id).execute()
+        except Exception:
+            pass
+
+        try:
+            supabase.table("notifications").delete().eq("user_id", target_user_id).eq("actor_id", uid).eq("type", "follow_request").execute()
         except Exception:
             pass
 
@@ -1603,6 +1649,11 @@ def accept_follow_request(request_id):
             "updated_at": utc_now_iso(),
         }).eq("id", request_id).execute()
 
+        try:
+            supabase.table("notifications").delete().eq("user_id", uid).eq("actor_id", requester_id).eq("type", "follow_request").execute()
+        except Exception:
+            pass
+
         target_profile = ensure_profile_row(uid)
         target_name = profile_display_name(target_profile)
 
@@ -1655,10 +1706,18 @@ def decline_follow_request(request_id):
                 "error": "Follow request not found.",
             }), 404
 
+        row = req_res.data[0]
+        requester_id = str(row.get("requester_id") or "")
+
         supabase.table("follow_requests").update({
             "status": "declined",
             "updated_at": utc_now_iso(),
         }).eq("id", request_id).execute()
+
+        try:
+            supabase.table("notifications").delete().eq("user_id", uid).eq("actor_id", requester_id).eq("type", "follow_request").execute()
+        except Exception:
+            pass
 
         return jsonify({
             "status": "ok",
@@ -3350,6 +3409,7 @@ def search_users():
 
     try:
         following_ids = load_following_ids(uid)
+        requested_ids = load_pending_follow_request_ids(uid)
 
         res = (
             supabase.table("profiles")
@@ -3374,14 +3434,19 @@ def search_users():
                 if q not in haystack:
                     continue
 
+            already_following = profile_id in following_ids
+            requested = profile_id in requested_ids
+
             profile = normalize_profile(row)
-            profile["following"] = profile_id in following_ids
+            profile["following"] = already_following
+            profile["follow_requested"] = requested
             profile["is_self"] = False
 
             matches.append({
                 "profile": profile,
-                "reason": "Search result" if q else "Corner athlete",
-                "already_following": profile_id in following_ids,
+                "reason": "Search result" if q else ("Requested" if requested else "Corner athlete"),
+                "already_following": already_following,
+                "requested": requested,
             })
 
             if len(matches) >= 25:
