@@ -1871,7 +1871,7 @@ def update_post_counts(post_id: str):
         pass
 
 
-@app.route("/session-post/<post_id>", methods=["PATCH", "DELETE"])
+@app.route("/session-post/<post_id>", methods=["GET", "PATCH", "DELETE"])
 def update_or_delete_session_post(post_id):
     uid, err = require_user_id()
     if err:
@@ -1885,6 +1885,21 @@ def update_or_delete_session_post(post_id):
             "status": "error",
             "error": "Post not found.",
         }), 404
+
+    if request.method == "GET":
+        if not can_view_post(row, uid):
+            return jsonify({
+                "status": "error",
+                "error": "Forbidden.",
+            }), 403
+
+        author_id = str(row.get("user_id") or "")
+        profiles_by_id = load_profiles_map([author_id])
+
+        return jsonify({
+            "status": "ok",
+            "post": safe_session_post(row, profiles_by_id, viewer_id=uid),
+        }), 200
 
     if str(row.get("user_id") or "") != uid:
         return jsonify({
