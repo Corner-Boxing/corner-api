@@ -759,6 +759,7 @@ def profile_payload(profile: dict | None, viewer_id: str | None = None):
     clean["followers_count"] = count_followers(profile_id) if profile_id else 0
     clean["following_count"] = count_following(profile_id) if profile_id else 0
     clean["primary_gym"] = get_user_primary_gym(profile_id) if profile_id else None
+    clean["stats"] = calculate_user_stats(profile_id) if profile_id else empty_user_stats()
 
     return clean
 
@@ -820,6 +821,11 @@ def safe_session_post(row: dict, profiles_by_id: dict, viewer_id: str | None = N
     likes_count = safe_int(row.get("likes_count"), 0)
     comments_count = safe_int(row.get("comments_count"), 0)
 
+    stat_awards = safe_json_value(row.get("stat_awards"), {})
+    round_breakdown = safe_json_value(row.get("round_breakdown"), [])
+    stat_total_points = safe_int(row.get("stat_total_points"), sum(safe_int(v, 0) for v in (stat_awards or {}).values()))
+    round_count = safe_int(row.get("round_count"), len(round_breakdown) if isinstance(round_breakdown, list) else 0)
+
     # Backfill counts for old rows where stored counters may still be zero.
     actual_likes = count_post_likes(post_id)
     actual_comments = count_post_comments(post_id)
@@ -835,6 +841,10 @@ def safe_session_post(row: dict, profiles_by_id: dict, viewer_id: str | None = N
         tags.append(f"{length_min} min")
     if pace:
         tags.append(str(pace))
+    if round_count:
+        tags.append(f"{round_count} rounds")
+    if stat_total_points:
+        tags.append(f"+{stat_total_points} pts")
     if music:
         tags.append(f"Music: {music}")
     if visibility:
@@ -849,7 +859,7 @@ def safe_session_post(row: dict, profiles_by_id: dict, viewer_id: str | None = N
         "created_at": created_at,
         "updated_at": row.get("updated_at"),
         "edited_at": row.get("edited_at"),
-        "tags": tags[:6],
+        "tags": tags[:8],
         "visibility": visibility,
         "class_session_id": row.get("class_session_id"),
         "job_id": row.get("job_id"),
@@ -858,6 +868,10 @@ def safe_session_post(row: dict, profiles_by_id: dict, viewer_id: str | None = N
         "difficulty": difficulty,
         "length_min": length_min,
         "class_mode": class_mode,
+        "stat_awards": stat_awards if isinstance(stat_awards, dict) else {},
+        "stat_total_points": stat_total_points,
+        "round_breakdown": round_breakdown if isinstance(round_breakdown, list) else [],
+        "round_count": round_count,
         "likes_count": likes_count,
         "comments_count": comments_count,
         "liked_by_me": viewer_liked_post(post_id, viewer_id),
@@ -872,6 +886,128 @@ def safe_int(value, fallback=0):
         return int(float(value))
     except Exception:
         return fallback
+
+
+STAT_KEYS = ["power", "speed", "defense", "footwork", "endurance", "focus"]
+
+STAT_LABELS = {
+    "power": "Power",
+    "speed": "Speed",
+    "defense": "Defense",
+    "footwork": "Footwork",
+    "endurance": "Endurance",
+    "focus": "Focus",
+}
+
+
+def empty_stat_points():
+    return {key: 0 for key in STAT_KEYS}
+
+
+def safe_json_value(value, fallback):
+    if value is None:
+        return fallback
+
+    if isinstance(value, (dict, list)):
+        return value
+
+    try:
+        parsed = json.loads(value)
+        if isinstance(parsed, type(fallback)):
+            return parsed
+        return fallback
+    except Exception:
+        return fallback
+
+
+def stat_level_from_points(points):
+    points = max(0, safe_int(points, 0))
+    if points <= 0:
+        return 0
+    return min(99, 1 + (points // 20))
+
+
+def build_stats_summary(stat_points: dict, completed_classes: int, total_minutes: int, total_rounds: int):
+    clean_points = empty_stat_points()
+
+    for key in STAT_KEYS:
+        clean_points[key] = max(0, safe_int((stat_points or {}).get(key), 0))
+
+    total_points = sum(clean_points.values())
+    stat_levels = {key: stat_level_from_points(clean_points.get(key, 0)) for key in STAT_KEYS}
+
+    primary_stat = max(STAT_KEYS, key=lambda key: clean_points.get(key, 0)) if total_points else None
+    level = 1 + (total_points // 100)
+    next_level_points = max(0, (level * 100) - total_points)
+
+    return {
+        "stat_keys": STAT_KEYS,
+        "stat_labels": STAT_LABELS,
+        "stat_points": clean_points,
+        "stat_levels": stat_levels,
+        "total_points": total_points,
+        "level": level,
+        "next_level_points": next_level_points,
+        "completed_classes": max(0, safe_int(completed_classes, 0)),
+        "total_minutes": max(0, safe_int(total_minutes, 0)),
+        "total_rounds": max(0, safe_int(total_rounds, 0)),
+        "primary_stat": primary_stat,
+    }
+
+
+def empty_user_stats():
+    return build_stats_summary(empty_stat_points(), 0, 0, 0)
+
+
+def calculate_user_stats(user_id: str | None):
+    if not user_id:
+        return empty_user_stats()
+
+    try:
+        res = (
+            supabase.table("class_sessions")
+            .select("id,length_min,round_count,stat_total_points,stat_awards,round_breakdown,status,listened_complete,completed_at")
+            .eq("user_id", user_id)
+            .eq("status", "done")
+            .eq("listened_complete", True)
+            .order("completed_at", desc=True)
+            .limit(300)
+            .execute()
+        )
+
+        rows = res.data or []
+        points = empty_stat_points()
+        total_minutes = 0
+        total_rounds = 0
+        completed_classes = 0
+
+        round_type_counts = {}
+
+        for row in rows:
+            completed_classes += 1
+            total_minutes += max(0, safe_int(row.get("length_min"), 0))
+
+            awards = safe_json_value(row.get("stat_awards"), {})
+            for key in STAT_KEYS:
+                points[key] += max(0, safe_int((awards or {}).get(key), 0))
+
+            breakdown = safe_json_value(row.get("round_breakdown"), [])
+            if isinstance(breakdown, list):
+                total_rounds += len(breakdown)
+                for r in breakdown:
+                    if isinstance(r, dict):
+                        rt = str(r.get("type") or "").strip()
+                        if rt:
+                            round_type_counts[rt] = round_type_counts.get(rt, 0) + 1
+            else:
+                total_rounds += max(0, safe_int(row.get("round_count"), 0))
+
+        summary = build_stats_summary(points, completed_classes, total_minutes, total_rounds)
+        summary["round_type_counts"] = round_type_counts
+        return summary
+
+    except Exception:
+        return empty_user_stats()
 
 
 def compute_listen_required_seconds(session_row: dict, audio_duration_seconds: int | None = None):
@@ -939,6 +1075,11 @@ def create_session_post_for_completed_session(session_row: dict):
     # Use values most likely to survive old/new schemas.
     preferred_visibility = "public" if bool(session_row.get("is_public")) else "friends_only"
 
+    stat_awards = safe_json_value(session_row.get("stat_awards"), {})
+    round_breakdown = safe_json_value(session_row.get("round_breakdown"), [])
+    stat_total_points = safe_int(session_row.get("stat_total_points"), sum(safe_int(v, 0) for v in (stat_awards or {}).values()))
+    round_count = safe_int(session_row.get("round_count"), len(round_breakdown) if isinstance(round_breakdown, list) else 0)
+
     base_payload = {
         "user_id": str(user_id),
         "class_session_id": str(session_id),
@@ -951,6 +1092,10 @@ def create_session_post_for_completed_session(session_row: dict):
         "length_min": length_min if length_min else None,
         "music": str(music),
         "pace": str(pace),
+        "stat_awards": stat_awards if isinstance(stat_awards, dict) else {},
+        "stat_total_points": stat_total_points,
+        "round_breakdown": round_breakdown if isinstance(round_breakdown, list) else [],
+        "round_count": round_count,
         "likes_count": 0,
         "comments_count": 0,
     }
@@ -1041,7 +1186,7 @@ def listen_heartbeat(job_id):
     try:
         sess_res = (
             supabase.table("class_sessions")
-            .select("id,job_id,user_id,is_public,class_mode,status,difficulty,length_min,pace,music,listen_required_seconds,listen_progress_seconds,listened_complete,listened_complete_at,storage_path")
+            .select("id,job_id,user_id,is_public,class_mode,status,difficulty,length_min,pace,music,listen_required_seconds,listen_progress_seconds,listened_complete,listened_complete_at,storage_path,round_breakdown,stat_awards,stat_total_points,round_count")
             .eq("job_id", job_id)
             .limit(1)
             .execute()
@@ -1095,7 +1240,7 @@ def listen_heartbeat(job_id):
         if already_complete or completed_now:
             refreshed = (
                 supabase.table("class_sessions")
-                .select("id,job_id,user_id,is_public,class_mode,status,difficulty,length_min,pace,music,listen_required_seconds,listen_progress_seconds,listened_complete,listened_complete_at,storage_path")
+                .select("id,job_id,user_id,is_public,class_mode,status,difficulty,length_min,pace,music,listen_required_seconds,listen_progress_seconds,listened_complete,listened_complete_at,storage_path,round_breakdown,stat_awards,stat_total_points,round_count")
                 .eq("id", session_row.get("id"))
                 .limit(1)
                 .execute()
