@@ -97,6 +97,92 @@ def profile_is_complete(profile: dict | None):
         return False
     return bool((profile.get("username") or "").strip() and (profile.get("display_name") or "").strip())
 
+AVATAR_VERSION = "avatar-v1"
+
+AVATAR_DEFAULT_CONFIG = {
+    "version": AVATAR_VERSION,
+    "presentation": "masc",
+    "colors": {
+        "skin": "#b8754f",
+        "skin_shadow": "#6c3b28",
+        "hair": "#392316",
+        "eyes": "#111217",
+        "top": "#111217",
+        "top_shadow": "#08090b",
+        "bottom": "#e63946",
+        "bottom_shadow": "#8d1f29",
+        "gloves": "#e63946",
+        "glove_shadow": "#8d1f29",
+        "wraps": "#f6f6f6",
+        "wrap_shadow": "#b9b9b9",
+        "shoes": "#111217",
+        "badge": "#d4af37",
+        "aura": "#d4af37",
+        "line": "#070708",
+    },
+    "parts": {
+        "stance": "guard-front",
+        "head": "standard",
+        "eyes": "focused",
+        "hair": "curly-medium",
+        "facial_hair": "none",
+        "top": "training-tank",
+        "bottom": "boxing-shorts",
+        "gloves": "classic",
+        "wraps": "standard",
+        "shoes": "boxing-boots",
+        "badge": "none",
+        "aura": "none",
+    },
+}
+
+
+def default_avatar_config():
+    return json.loads(json.dumps(AVATAR_DEFAULT_CONFIG))
+
+
+def safe_hex_color(value, fallback):
+    value = str(value or "").strip()
+    if value == "transparent":
+        return value
+    if re.fullmatch(r"#[0-9a-fA-F]{6}", value):
+        return value.lower()
+    return fallback
+
+
+def safe_avatar_id(value, fallback):
+    value = str(value or "").strip().lower()
+    if re.fullmatch(r"[a-z0-9_-]{1,64}", value):
+        return value
+    return fallback
+
+
+def clean_avatar_config(value):
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            value = {}
+
+    if not isinstance(value, dict):
+        value = {}
+
+    clean = default_avatar_config()
+
+    presentation = str(value.get("presentation") or clean["presentation"]).strip().lower()
+    if presentation in ("masc", "fem"):
+        clean["presentation"] = presentation
+
+    colors = value.get("colors") if isinstance(value.get("colors"), dict) else {}
+    for key, fallback in clean["colors"].items():
+        clean["colors"][key] = safe_hex_color(colors.get(key), fallback)
+
+    parts = value.get("parts") if isinstance(value.get("parts"), dict) else {}
+    for key, fallback in clean["parts"].items():
+        clean["parts"][key] = safe_avatar_id(parts.get(key), fallback)
+
+    clean["version"] = AVATAR_VERSION
+    return clean
 
 def ensure_profile_row(user_id: str):
     if not user_id:
@@ -104,7 +190,7 @@ def ensure_profile_row(user_id: str):
 
     res = (
         supabase.table("profiles")
-        .select("id,username,display_name,bio,avatar_url,account_privacy,plan_tier,subscription_status,tier_updated_at,created_at,updated_at")
+        .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at,plan_tier,subscription_status,tier_updated_at,created_at,updated_at")
         .eq("id", user_id)
         .limit(1)
         .execute()
@@ -119,6 +205,9 @@ def ensure_profile_row(user_id: str):
         "display_name": None,
         "bio": "",
         "avatar_url": "assets/avatars/default-avatar-head.png",
+        "avatar_config": default_avatar_config(),
+        "avatar_version": AVATAR_VERSION,
+        "avatar_updated_at": utc_now_iso(),
         "account_privacy": "public",
         "plan_tier": "free",
         "created_at": utc_now_iso(),
@@ -132,7 +221,7 @@ def ensure_profile_row(user_id: str):
     # Race-condition fallback: if another request created it first, read again.
     retry = (
         supabase.table("profiles")
-        .select("id,username,display_name,bio,avatar_url,account_privacy,plan_tier,subscription_status,tier_updated_at,created_at,updated_at")
+        .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at,plan_tier,subscription_status,tier_updated_at,created_at,updated_at")
         .eq("id", user_id)
         .limit(1)
         .execute()
@@ -368,6 +457,54 @@ def update_my_profile():
         "profile_complete": profile_is_complete(saved),
     }), 200
 
+@app.route("/me/avatar", methods=["PATCH"])
+def update_my_avatar():
+    uid, err = require_user_id()
+    if err:
+        return err
+
+    data = request.get_json(force=True, silent=True) or {}
+    avatar_config = clean_avatar_config(data.get("avatar_config"))
+
+    try:
+        ensure_profile_row(uid)
+
+        payload = {
+            "avatar_config": avatar_config,
+            "avatar_version": AVATAR_VERSION,
+            "avatar_updated_at": utc_now_iso(),
+            "updated_at": utc_now_iso(),
+        }
+
+        res = (
+            supabase.table("profiles")
+            .update(payload)
+            .eq("id", uid)
+            .execute()
+        )
+
+        err_msg = supa_err(res)
+        if err_msg:
+            return jsonify({
+                "status": "error",
+                "error": "Avatar update failed.",
+                "details": err_msg,
+            }), 500
+
+        saved = ensure_profile_row(uid)
+
+        return jsonify({
+            "status": "ok",
+            "profile": profile_payload(saved, uid),
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error": "Could not save avatar.",
+            "details": str(e),
+        }), 500
+
 @app.route("/generate", methods=["POST"])
 def generate():
     """
@@ -551,12 +688,17 @@ def normalize_profile(row: dict | None):
     if account_privacy not in ("public", "private"):
         account_privacy = "public"
 
+    avatar_config = clean_avatar_config(row.get("avatar_config"))
+
     return {
         "id": row.get("id"),
         "username": username,
         "display_name": display_name or username or "Corner athlete",
         "bio": row.get("bio") or "",
         "avatar_url": row.get("avatar_url") or "assets/avatars/default-avatar-head.png",
+        "avatar_config": avatar_config,
+        "avatar_version": row.get("avatar_version") or AVATAR_VERSION,
+        "avatar_updated_at": row.get("avatar_updated_at"),
         "account_privacy": account_privacy,
     }
 
@@ -569,7 +711,7 @@ def load_profiles_map(user_ids: list[str]):
     try:
         res = (
             supabase.table("profiles")
-            .select("id,username,display_name,bio,avatar_url,account_privacy")
+            .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at")
             .in_("id", clean_ids)
             .execute()
         )
@@ -1492,7 +1634,7 @@ def home_suggestions():
 
         res = (
             supabase.table("profiles")
-            .select("id,username,display_name,bio,avatar_url,account_privacy")
+            .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at")
             .neq("id", uid)
             .limit(60)
             .execute()
@@ -1896,7 +2038,7 @@ def profile_posts(profile_id):
 
         profile_res = (
             supabase.table("profiles")
-            .select("id,username,display_name,bio,avatar_url,account_privacy")
+            .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at")
             .eq("id", profile_id)
             .limit(1)
             .execute()
@@ -3672,7 +3814,7 @@ def search_users():
 
         res = (
             supabase.table("profiles")
-            .select("id,username,display_name,bio,avatar_url,account_privacy")
+            .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at")
             .limit(100)
             .execute()
         )
@@ -3738,7 +3880,7 @@ def read_profile_by_username(username):
     try:
         res = (
             supabase.table("profiles")
-            .select("id,username,display_name,bio,avatar_url,account_privacy,created_at,plan_tier")
+            .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at,created_at,plan_tier")
             .eq("username", username)
             .limit(1)
             .execute()
@@ -3862,7 +4004,7 @@ def read_profile(profile_id):
     try:
         res = (
             supabase.table("profiles")
-            .select("id,username,display_name,bio,avatar_url,account_privacy,created_at,plan_tier")
+            .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at,created_at,plan_tier")
             .eq("id", profile_id)
             .limit(1)
             .execute()
