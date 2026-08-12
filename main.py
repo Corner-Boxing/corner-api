@@ -207,7 +207,7 @@ def ensure_profile_row(user_id: str):
         "username": None,
         "display_name": None,
         "bio": "",
-        "avatar_url": "assets/avatars/default-avatar-head.png",
+        "avatar_url": "",
         "avatar_config": default_avatar_config(),
         "avatar_version": AVATAR_VERSION,
         "avatar_updated_at": utc_now_iso(),
@@ -412,7 +412,7 @@ def update_my_profile():
                 "error": "Avatar URL is not allowed.",
             }), 400
     else:
-        avatar_url = "assets/avatars/default-avatar-head.png"
+        avatar_url = ""
 
     existing_username = (
         supabase.table("profiles")
