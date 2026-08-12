@@ -104,21 +104,15 @@ AVATAR_DEFAULT_CONFIG = {
     "presentation": "masc",
     "colors": {
         "skin": "#b8754f",
-        "skin_shadow": "#6c3b28",
         "hair": "#392316",
         "eyes": "#111217",
         "top": "#111217",
-        "top_shadow": "#08090b",
         "bottom": "#e63946",
-        "bottom_shadow": "#8d1f29",
         "gloves": "#e63946",
-        "glove_shadow": "#8d1f29",
         "wraps": "#f6f6f6",
-        "wrap_shadow": "#b9b9b9",
         "shoes": "#111217",
         "badge": "#d4af37",
         "aura": "#d4af37",
-        "line": "#070708",
     },
     "parts": {
         "stance": "guard-front",
@@ -180,6 +174,15 @@ def clean_avatar_config(value):
     parts = value.get("parts") if isinstance(value.get("parts"), dict) else {}
     for key, fallback in clean["parts"].items():
         clean["parts"][key] = safe_avatar_id(parts.get(key), fallback)
+
+    # Required clothing rule: users may remove optional clothing pieces,
+    # but they must always have a bottom/shorts selection.
+    if clean["parts"].get("bottom") in ("", "none", None):
+        clean["parts"]["bottom"] = AVATAR_DEFAULT_CONFIG["parts"]["bottom"]
+
+    # Female avatar rule: facial hair is not available.
+    if clean["presentation"] == "fem":
+        clean["parts"]["facial_hair"] = "none"
 
     clean["version"] = AVATAR_VERSION
     return clean
