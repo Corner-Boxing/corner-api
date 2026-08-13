@@ -698,7 +698,7 @@ def normalize_profile(row: dict | None):
         "username": username,
         "display_name": display_name or username or "Corner athlete",
         "bio": row.get("bio") or "",
-        "avatar_url": row.get("avatar_url") or "assets/avatars/default-avatar-head.png",
+        "avatar_url": row.get("avatar_url") or "",
         "avatar_config": avatar_config,
         "avatar_version": row.get("avatar_version") or AVATAR_VERSION,
         "avatar_updated_at": row.get("avatar_updated_at"),
