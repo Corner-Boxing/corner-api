@@ -1537,7 +1537,7 @@ def home_notifications():
             .select("*")
             .eq("user_id", uid)
             .order("created_at", desc=True)
-            .limit(40)
+            .limit(30)
             .execute()
         )
 
@@ -1639,7 +1639,7 @@ def home_suggestions():
             supabase.table("profiles")
             .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at")
             .neq("id", uid)
-            .limit(60)
+            .limit(30)
             .execute()
         )
 
@@ -2070,7 +2070,7 @@ def profile_posts(profile_id):
             .select("*")
             .eq("user_id", profile_id)
             .order("created_at", desc=True)
-            .limit(40)
+            .limit(30)
             .execute()
         )
 
@@ -2867,7 +2867,7 @@ def load_gym_posts(gym_id: str, viewer_id: str):
         .select("*")
         .eq("gym_id", gym_id)
         .order("created_at", desc=True)
-        .limit(80)
+        .limit(30)
         .execute()
     )
 
@@ -3918,6 +3918,8 @@ def profile_following(profile_id):
             supabase.table("follows")
             .select("following_id,created_at")
             .eq("follower_id", profile_id)
+            .order("created_at", desc=True)
+            .limit(80)
             .execute()
         )
 
@@ -3964,6 +3966,8 @@ def profile_followers(profile_id):
             supabase.table("follows")
             .select("follower_id,created_at")
             .eq("following_id", profile_id)
+            .order("created_at", desc=True)
+            .limit(80)
             .execute()
         )
 
