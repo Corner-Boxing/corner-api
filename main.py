@@ -1546,14 +1546,33 @@ def home_notifications():
         actor_ids = [str(row.get("actor_id")) for row in rows if row.get("actor_id")]
         profiles_by_id = load_profiles_map(actor_ids)
 
+        pending_request_by_actor = {}
+        try:
+            req_res = (
+                supabase.table("follow_requests")
+                .select("id,requester_id")
+                .eq("target_id", uid)
+                .eq("status", "pending")
+                .execute()
+            )
+
+            for req in (req_res.data or []):
+                requester_id = str(req.get("requester_id") or "")
+                if requester_id:
+                    pending_request_by_actor[requester_id] = req.get("id")
+        except Exception:
+            pending_request_by_actor = {}
+
         items = []
         for row in rows:
             actor_id = str(row.get("actor_id") or "")
             actor = profiles_by_id.get(actor_id)
+            type_ = row.get("type") or "notification"
+            follow_request_id = pending_request_by_actor.get(actor_id) if type_ == "follow_request" else None
 
             items.append({
                 "id": row.get("id"),
-                "type": row.get("type") or "notification",
+                "type": type_,
                 "title": row.get("title") or "Notification",
                 "body": row.get("body") or row.get("message") or "",
                 "read": bool(row.get("read") or row.get("is_read") or False),
@@ -1561,6 +1580,8 @@ def home_notifications():
                 "actor": actor,
                 "entity_type": row.get("entity_type"),
                 "entity_id": row.get("entity_id"),
+                "follow_request_id": follow_request_id,
+                "can_delete": not bool(type_ == "follow_request" and follow_request_id),
             })
 
         return jsonify({
@@ -1610,6 +1631,44 @@ def delete_notification(notification_id):
     notification_id = str(notification_id or "").strip()
 
     try:
+        existing = (
+            supabase.table("notifications")
+            .select("*")
+            .eq("id", notification_id)
+            .eq("user_id", uid)
+            .limit(1)
+            .execute()
+        )
+
+        row = existing.data[0] if existing.data else None
+
+        if not row:
+            return jsonify({
+                "status": "ok",
+                "notification_id": notification_id,
+                "deleted": True,
+            }), 200
+
+        type_ = str(row.get("type") or "").strip().lower()
+        actor_id = str(row.get("actor_id") or "").strip()
+
+        if type_ == "follow_request" and actor_id:
+            pending = (
+                supabase.table("follow_requests")
+                .select("id")
+                .eq("requester_id", actor_id)
+                .eq("target_id", uid)
+                .eq("status", "pending")
+                .limit(1)
+                .execute()
+            )
+
+            if pending.data:
+                return jsonify({
+                    "status": "blocked",
+                    "error": "Respond to this follow request before clearing the notification.",
+                }), 409
+
         supabase.table("notifications").delete().eq("id", notification_id).eq("user_id", uid).execute()
 
         return jsonify({
@@ -1783,7 +1842,7 @@ def follow_user(target_user_id):
                     uid,
                     "follow_request",
                     f"{actor_name} requested to follow you.",
-                    "Approve the request from Profile → People → Requests.",
+                    "Approve or decline this request directly from your notifications.",
                     "profile",
                     uid,
                 )
@@ -1856,7 +1915,7 @@ def my_follow_requests():
             .eq("target_id", uid)
             .eq("status", "pending")
             .order("created_at", desc=True)
-            .limit(100)
+            .limit(30)
             .execute()
         )
 
