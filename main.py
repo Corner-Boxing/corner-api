@@ -97,36 +97,240 @@ def profile_is_complete(profile: dict | None):
         return False
     return bool((profile.get("username") or "").strip() and (profile.get("display_name") or "").strip())
 
-AVATAR_VERSION = "avatar-v1"
+AVATAR_VERSION = "avatar-v2"
+
+AVATAR_ACHIEVEMENT_BADGES = {
+    "first-strike": {
+        "name": "First Strike Badge",
+        "unlock_description": "Complete your first class.",
+    },
+    "contender": {
+        "name": "Contender Badge",
+        "unlock_description": "Complete 10 classes.",
+    },
+    "pro-fighter": {
+        "name": "Pro Fighter Badge",
+        "unlock_description": "Complete 50 classes.",
+    },
+    "century-club": {
+        "name": "Century Club Badge",
+        "unlock_description": "Complete 100 classes.",
+    },
+    "novice": {
+        "name": "Novice Badge",
+        "unlock_description": "Reach level 1.",
+    },
+    "amateur": {
+        "name": "Amateur Badge",
+        "unlock_description": "Reach level 2.",
+    },
+    "heavy-hitter": {
+        "name": "Heavy Hitter Badge",
+        "unlock_description": "Reach level 5.",
+    },
+    "ding-ding": {
+        "name": "Ding Ding Badge",
+        "unlock_description": "Complete 100 total rounds.",
+    },
+    "charged": {
+        "name": "Charged Badge",
+        "unlock_description": "Earn 100 total Endurance stat points.",
+    },
+    "speeding-up": {
+        "name": "Speeding Up Badge",
+        "unlock_description": "Earn 100 total Speed stat points.",
+    },
+    "feel-the-power": {
+        "name": "Feel the Power Badge",
+        "unlock_description": "Earn 100 total Power stat points.",
+    },
+    "stand-back": {
+        "name": "Stand Back Badge",
+        "unlock_description": "Earn 100 total Defense stat points.",
+    },
+    "jump-around": {
+        "name": "Jump Around Badge",
+        "unlock_description": "Earn 100 total Footwork stat points.",
+    },
+    "good-eye": {
+        "name": "Good Eye Badge",
+        "unlock_description": "Earn 100 total Focus stat points.",
+    },
+    "huddle-up": {
+        "name": "Huddle Up Badge",
+        "unlock_description": "Join a gym for the first time.",
+    },
+    "thousand-island": {
+        "name": "Thousand Island Badge",
+        "unlock_description": "Earn 1,000 total stat points across all categories.",
+    },
+}
+
+AVATAR_ALLOWED_OPTIONS = {
+    "stance": {"guard-front"},
+    "head": {"standard"},
+
+    "eyes": {
+        "angry",
+        "focused",
+        "neutral",
+        "shiner",
+        "tired",
+    },
+
+    "hair": {
+        "none",
+        "bob",
+        "braids",
+        "buzz-cut",
+        "crew-cut",
+        "curly-long",
+        "curly-medium",
+        "middle-part",
+        "pigtails",
+        "ponytail",
+        "straight-long",
+    },
+
+    "facial_hair": {
+        "none",
+        "beard",
+        "goatee",
+        "mustache",
+        "stubble",
+    },
+
+    "top": {
+        "none",
+        "basic-tee",
+        "compression-tee",
+        "robe",
+        "training-tank",
+    },
+
+    "bottom": {
+        "boxing-shorts",
+        "joggers",
+        "leggings",
+    },
+
+    "gloves": {
+        "none",
+        "classic",
+    },
+
+    "wraps": {
+        "none",
+        "standard",
+    },
+
+    "shoes": {
+        "none",
+        "boxing-boots",
+        "training-shoes",
+    },
+
+    "headwear": {
+        "none",
+        "basic-cap",
+        "headband",
+    },
+
+    "facewear": {
+        "none",
+        "glasses",
+        "shades",
+    },
+
+    "neckwear": {
+        "none",
+        "basic-chain",
+        "cross-chain",
+        "pendant-chain",
+    },
+
+    "badge": {
+        "none",
+        "corner-badge",
+        *AVATAR_ACHIEVEMENT_BADGES.keys(),
+    },
+}
+
+AVATAR_LIMITED_COLOR_VALUES = {
+    "hair": {
+        "#171311",
+        "#392316",
+        "#6b3f22",
+        "#d8b45f",
+        "#9f3b1e",
+        "#77706a",
+        "#f6f6f6",
+    },
+
+    "eyes": {
+        "#111217",
+        "#3b2618",
+        "#80612c",
+        "#5b8fc8",
+        "#4f8c59",
+    },
+
+    "facewear": {
+        "#111217",
+        "#4a3024",
+        "#b8bdc4",
+        "#d4af37",
+    },
+
+    "neckwear": {
+        "#d4af37",
+        "#c2c6cc",
+        "#9a6a3a",
+        "#6f4a2e",
+    },
+}
 
 AVATAR_DEFAULT_CONFIG = {
     "version": AVATAR_VERSION,
+
     "presentation": "masc",
+
     "colors": {
         "skin": "#b8754f",
         "hair": "#392316",
         "eyes": "#111217",
+
         "top": "#111217",
         "bottom": "#e63946",
+
         "gloves": "#e63946",
         "wraps": "#f6f6f6",
         "shoes": "#111217",
-        "badge": "#d4af37",
-        "aura": "#d4af37",
+
+        "headwear": "#111217",
+        "facewear": "#111217",
+        "neckwear": "#d4af37",
     },
+
     "parts": {
         "stance": "guard-front",
         "head": "standard",
-        "eyes": "focused",
+
+        "eyes": "neutral",
         "hair": "curly-medium",
         "facial_hair": "none",
+
         "top": "training-tank",
         "bottom": "boxing-shorts",
+
         "gloves": "classic",
         "wraps": "standard",
         "shoes": "boxing-boots",
+
+        "headwear": "none",
+        "facewear": "none",
+        "neckwear": "none",
         "badge": "none",
-        "aura": "none",
     },
 }
 
@@ -136,22 +340,24 @@ def default_avatar_config():
 
 
 def safe_hex_color(value, fallback):
-    value = str(value or "").strip()
-    if value == "transparent":
+    value = str(value or "").strip().lower()
+
+    if re.fullmatch(r"#[0-9a-f]{6}", value):
         return value
-    if re.fullmatch(r"#[0-9a-fA-F]{6}", value):
-        return value.lower()
+
     return fallback
 
 
 def safe_avatar_id(value, fallback):
     value = str(value or "").strip().lower()
+
     if re.fullmatch(r"[a-z0-9_-]{1,64}", value):
         return value
+
     return fallback
 
 
-def clean_avatar_config(value):
+def clean_avatar_config(value, user_id: str | None = None):
     if isinstance(value, str):
         try:
             value = json.loads(value)
@@ -163,28 +369,92 @@ def clean_avatar_config(value):
 
     clean = default_avatar_config()
 
-    presentation = str(value.get("presentation") or clean["presentation"]).strip().lower()
+    presentation = str(
+        value.get("presentation")
+        or clean["presentation"]
+    ).strip().lower()
+
     if presentation in ("masc", "fem"):
         clean["presentation"] = presentation
 
-    colors = value.get("colors") if isinstance(value.get("colors"), dict) else {}
+    colors = (
+        value.get("colors")
+        if isinstance(value.get("colors"), dict)
+        else {}
+    )
+
     for key, fallback in clean["colors"].items():
-        clean["colors"][key] = safe_hex_color(colors.get(key), fallback)
+        candidate = safe_hex_color(
+            colors.get(key),
+            fallback,
+        )
 
-    parts = value.get("parts") if isinstance(value.get("parts"), dict) else {}
+        allowed_values = AVATAR_LIMITED_COLOR_VALUES.get(key)
+
+        clean["colors"][key] = (
+            candidate
+            if not allowed_values or candidate in allowed_values
+            else fallback
+        )
+
+    parts = (
+        value.get("parts")
+        if isinstance(value.get("parts"), dict)
+        else {}
+    )
+
     for key, fallback in clean["parts"].items():
-        clean["parts"][key] = safe_avatar_id(parts.get(key), fallback)
+        candidate = safe_avatar_id(
+            parts.get(key),
+            fallback,
+        )
 
-    # Required clothing rule: users may remove optional clothing pieces,
-    # but they must always have a bottom/shorts selection.
+        allowed = AVATAR_ALLOWED_OPTIONS.get(key)
+
+        clean["parts"][key] = (
+            candidate
+            if not allowed or candidate in allowed
+            else fallback
+        )
+
+    # Leggings only exist in the feminine asset tree.
+    if (
+        clean["presentation"] == "masc"
+        and clean["parts"].get("bottom") == "leggings"
+    ):
+        clean["parts"]["bottom"] = "boxing-shorts"
+
+    # A bottom is always required.
     if clean["parts"].get("bottom") in ("", "none", None):
-        clean["parts"]["bottom"] = AVATAR_DEFAULT_CONFIG["parts"]["bottom"]
+        clean["parts"]["bottom"] = (
+            AVATAR_DEFAULT_CONFIG["parts"]["bottom"]
+        )
 
-    # Female avatar rule: facial hair is not available.
+    # Facial hair is unavailable on the feminine base.
     if clean["presentation"] == "fem":
         clean["parts"]["facial_hair"] = "none"
 
+    # Achievement badge ownership is server-authoritative.
+    selected_badge = (
+        clean["parts"].get("badge")
+        or "none"
+    )
+
+    if (
+        selected_badge in AVATAR_ACHIEVEMENT_BADGES
+        and user_id
+    ):
+        try:
+            unlocked = get_unlocked_avatar_badges(user_id)
+
+            if selected_badge not in unlocked:
+                clean["parts"]["badge"] = "none"
+
+        except Exception:
+            clean["parts"]["badge"] = "none"
+
     clean["version"] = AVATAR_VERSION
+
     return clean
 
 def ensure_profile_row(user_id: str):
@@ -218,7 +488,16 @@ def ensure_profile_row(user_id: str):
     }
 
     insert_res = supabase.table("profiles").insert(payload).execute()
+
     if insert_res.data:
+        # Current Corner level math begins at level 1.
+        # A genuinely new account therefore earns Novice immediately.
+        record_avatar_badge_unlock(
+            user_id,
+            "novice",
+            notify=True,
+        )
+
         return insert_res.data[0]
 
     # Race-condition fallback: if another request created it first, read again.
@@ -467,7 +746,10 @@ def update_my_avatar():
         return err
 
     data = request.get_json(force=True, silent=True) or {}
-    avatar_config = clean_avatar_config(data.get("avatar_config"))
+    avatar_config = clean_avatar_config(
+        data.get("avatar_config"),
+        user_id=uid,
+    )
 
     try:
         ensure_profile_row(uid)
@@ -901,10 +1183,56 @@ def profile_payload(profile: dict | None, viewer_id: str | None = None):
     clean["is_self"] = is_self
     clean["following"] = following
     clean["follow_requested"] = follow_requested
-    clean["followers_count"] = count_followers(profile_id) if profile_id else 0
-    clean["following_count"] = count_following(profile_id) if profile_id else 0
-    clean["primary_gym"] = get_user_primary_gym(profile_id) if profile_id else None
-    clean["stats"] = calculate_user_stats(profile_id) if profile_id else empty_user_stats()
+    clean["followers_count"] = (
+        count_followers(profile_id)
+        if profile_id
+        else 0
+    )
+
+    clean["following_count"] = (
+        count_following(profile_id)
+        if profile_id
+        else 0
+    )
+
+    primary_gym = (
+        get_user_primary_gym(profile_id)
+        if profile_id
+        else None
+    )
+
+    stats = (
+        calculate_user_stats(profile_id)
+        if profile_id
+        else empty_user_stats()
+    )
+
+    clean["primary_gym"] = primary_gym
+    clean["stats"] = stats
+
+    if profile_id and is_self:
+        # Existing users may already satisfy achievements.
+        # Record those silently during migration instead of flooding
+        # them with historical badge notifications.
+        sync_progress_badge_unlocks(
+            profile_id,
+            stats,
+            notify_new=False,
+        )
+
+        if primary_gym:
+            record_avatar_badge_unlock(
+                profile_id,
+                "huddle-up",
+                notify=False,
+            )
+
+        clean["unlocked_badges"] = sorted(
+            get_unlocked_avatar_badges(
+                profile_id,
+                stats,
+            )
+        )
 
     return clean
 
@@ -1154,6 +1482,289 @@ def calculate_user_stats(user_id: str | None):
     except Exception:
         return empty_user_stats()
 
+def badge_ids_from_stats(stats: dict | None):
+    stats = stats or empty_user_stats()
+
+    stat_points = (
+        stats.get("stat_points")
+        if isinstance(stats.get("stat_points"), dict)
+        else {}
+    )
+
+    completed_classes = max(
+        0,
+        safe_int(stats.get("completed_classes"), 0),
+    )
+
+    total_rounds = max(
+        0,
+        safe_int(stats.get("total_rounds"), 0),
+    )
+
+    total_points = max(
+        0,
+        safe_int(stats.get("total_points"), 0),
+    )
+
+    level = max(
+        1,
+        safe_int(stats.get("level"), 1),
+    )
+
+    earned = set()
+
+    if completed_classes >= 1:
+        earned.add("first-strike")
+
+    if completed_classes >= 10:
+        earned.add("contender")
+
+    if completed_classes >= 50:
+        earned.add("pro-fighter")
+
+    if completed_classes >= 100:
+        earned.add("century-club")
+
+    if level >= 1:
+        earned.add("novice")
+
+    if level >= 2:
+        earned.add("amateur")
+
+    if level >= 5:
+        earned.add("heavy-hitter")
+
+    if total_rounds >= 100:
+        earned.add("ding-ding")
+
+    if max(
+        0,
+        safe_int(stat_points.get("endurance"), 0),
+    ) >= 100:
+        earned.add("charged")
+
+    if max(
+        0,
+        safe_int(stat_points.get("speed"), 0),
+    ) >= 100:
+        earned.add("speeding-up")
+
+    if max(
+        0,
+        safe_int(stat_points.get("power"), 0),
+    ) >= 100:
+        earned.add("feel-the-power")
+
+    if max(
+        0,
+        safe_int(stat_points.get("defense"), 0),
+    ) >= 100:
+        earned.add("stand-back")
+
+    if max(
+        0,
+        safe_int(stat_points.get("footwork"), 0),
+    ) >= 100:
+        earned.add("jump-around")
+
+    if max(
+        0,
+        safe_int(stat_points.get("focus"), 0),
+    ) >= 100:
+        earned.add("good-eye")
+
+    if total_points >= 1000:
+        earned.add("thousand-island")
+
+    return earned
+
+
+def load_persisted_avatar_badges(
+    user_id: str | None,
+):
+    if not user_id:
+        return set()
+
+    try:
+        res = (
+            supabase
+            .table("avatar_badge_unlocks")
+            .select("badge_id")
+            .eq("user_id", user_id)
+            .execute()
+        )
+
+        return {
+            str(row.get("badge_id") or "").strip()
+            for row in (res.data or [])
+            if str(row.get("badge_id") or "").strip()
+            in AVATAR_ACHIEVEMENT_BADGES
+        }
+
+    except Exception:
+        return set()
+
+
+def record_avatar_badge_unlock(
+    user_id: str | None,
+    badge_id: str,
+    notify: bool = False,
+):
+    badge_id = str(
+        badge_id or ""
+    ).strip().lower()
+
+    meta = AVATAR_ACHIEVEMENT_BADGES.get(
+        badge_id
+    )
+
+    if not user_id or not meta:
+        return False
+
+    try:
+        existing = (
+            supabase
+            .table("avatar_badge_unlocks")
+            .select("badge_id")
+            .eq("user_id", user_id)
+            .eq("badge_id", badge_id)
+            .limit(1)
+            .execute()
+        )
+
+        if existing.data:
+            return False
+
+        try:
+            inserted = (
+                supabase
+                .table("avatar_badge_unlocks")
+                .insert({
+                    "user_id": user_id,
+                    "badge_id": badge_id,
+                    "unlocked_at": utc_now_iso(),
+                })
+                .execute()
+            )
+
+            if not inserted.data:
+                verify = (
+                    supabase
+                    .table("avatar_badge_unlocks")
+                    .select("badge_id")
+                    .eq("user_id", user_id)
+                    .eq("badge_id", badge_id)
+                    .limit(1)
+                    .execute()
+                )
+
+                if not verify.data:
+                    return False
+
+        except Exception:
+            # If simultaneous requests race, the primary key means
+            # exactly one wins. Do not duplicate the notification.
+            verify = (
+                supabase
+                .table("avatar_badge_unlocks")
+                .select("badge_id")
+                .eq("user_id", user_id)
+                .eq("badge_id", badge_id)
+                .limit(1)
+                .execute()
+            )
+
+            if verify.data:
+                return False
+
+            raise
+
+        if notify:
+            create_notification(
+                user_id,
+                None,
+                f"badge_unlock:{badge_id}",
+                f"Badge unlocked: {meta['name']}",
+                (
+                    f"{meta['unlock_description']} "
+                    "Tap to equip it in Avatar Customization."
+                ),
+                "avatar_badge",
+                None,
+            )
+
+        return True
+
+    except Exception as e:
+        print(
+            "[avatar-badge] unlock failed "
+            f"user={user_id} "
+            f"badge={badge_id}: {e}"
+        )
+
+        return False
+
+
+def sync_progress_badge_unlocks(
+    user_id: str | None,
+    stats: dict | None = None,
+    notify_new: bool = False,
+):
+    if not user_id:
+        return []
+
+    stats = stats or calculate_user_stats(
+        user_id
+    )
+
+    earned = badge_ids_from_stats(
+        stats
+    )
+
+    newly_unlocked = []
+
+    # Dictionary insertion order deliberately determines the order
+    # when several achievements unlock at the same moment.
+    for badge_id in AVATAR_ACHIEVEMENT_BADGES.keys():
+        if badge_id == "huddle-up":
+            continue
+
+        if badge_id not in earned:
+            continue
+
+        unlocked_now = (
+            record_avatar_badge_unlock(
+                user_id,
+                badge_id,
+                notify=notify_new,
+            )
+        )
+
+        if unlocked_now:
+            newly_unlocked.append(
+                badge_id
+            )
+
+    return newly_unlocked
+
+
+def get_unlocked_avatar_badges(
+    user_id: str | None,
+    stats: dict | None = None,
+):
+    if not user_id:
+        return {"corner-badge"}
+
+    stats = (
+        stats
+        or calculate_user_stats(user_id)
+    )
+
+    return (
+        {"corner-badge"}
+        | badge_ids_from_stats(stats)
+        | load_persisted_avatar_badges(user_id)
+    )
 
 def compute_listen_required_seconds(session_row: dict, audio_duration_seconds: int | None = None):
     existing = safe_int(session_row.get("listen_required_seconds"), 0)
@@ -1371,13 +1982,44 @@ def listen_heartbeat(job_id):
         }
 
         completed_now = False
+        badge_unlocks = []
 
-        if not already_complete and new_progress >= required_seconds:
+        if (
+            not already_complete
+            and new_progress >= required_seconds
+        ):
+            # Capture historical achievements before counting
+            # this new completion. Existing achievements are
+            # silently backfilled instead of re-announced.
+            stats_before = calculate_user_stats(uid)
+
+            sync_progress_badge_unlocks(
+                uid,
+                stats_before,
+                notify_new=False,
+            )
+
             completed_now = True
+
             update_payload["listened_complete"] = True
             update_payload["listened_complete_at"] = utc_now_iso()
 
-        supabase.table("class_sessions").update(update_payload).eq("id", session_row.get("id")).execute()
+        (
+            supabase
+            .table("class_sessions")
+            .update(update_payload)
+            .eq("id", session_row.get("id"))
+            .execute()
+        )
+
+        if completed_now:
+            stats_after = calculate_user_stats(uid)
+
+            badge_unlocks = sync_progress_badge_unlocks(
+                uid,
+                stats_after,
+                notify_new=True,
+            )
 
         post = None
         post_error = None
@@ -1407,6 +2049,7 @@ def listen_heartbeat(job_id):
             "post": post,
             "post_created": bool(post),
             "post_error": post_error,
+            "badge_unlocks": badge_unlocks,
         }), 200
 
     except Exception as e:
@@ -3139,6 +3782,12 @@ def create_gym():
             "joined_at": utc_now_iso(),
         }).execute()
 
+        record_avatar_badge_unlock(
+            uid,
+            "huddle-up",
+            notify=True,
+        )
+
         supabase.table("gym_posts").insert({
             "gym_id": gym_id,
             "user_id": uid,
@@ -3343,6 +3992,12 @@ def join_gym(gym_id):
             "role": "member",
             "joined_at": utc_now_iso(),
         }).execute()
+
+        record_avatar_badge_unlock(
+            uid,
+            "huddle-up",
+            notify=True,
+        )
 
         refresh_gym_member_count(gym_id)
 
@@ -3729,6 +4384,12 @@ def join_gym_by_code(code):
             "role": "member",
             "joined_at": utc_now_iso(),
         }).execute()
+
+        record_avatar_badge_unlock(
+            uid,
+            "huddle-up",
+            notify=True,
+        )
 
         refresh_gym_member_count(gym_id)
 
