@@ -3,7 +3,7 @@ import time
 import base64
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client, Client
@@ -34,6 +34,7 @@ DEMO_LENGTH_MIN = 20              # locked
 DEMO_MUSIC = "demo"               # locked (we'll add audio later; for now it's just a label)
 DEMO_PACE = "Normal"              # keep simple + consistent
 GUEST_GENERATE_COOLDOWN_SECONDS = 15
+GYM_POST_RETENTION_DAYS = 10
 _guest_last_generate_by_ip = {}
 
 
@@ -256,38 +257,13 @@ AVATAR_ALLOWED_OPTIONS = {
     },
 }
 
-AVATAR_LIMITED_COLOR_VALUES = {
-    "hair": {
-        "#171311",
-        "#392316",
-        "#6b3f22",
-        "#d8b45f",
-        "#9f3b1e",
-        "#77706a",
-        "#f6f6f6",
-    },
-
-    "eyes": {
-        "#111217",
-        "#3b2618",
-        "#80612c",
-        "#5b8fc8",
-        "#4f8c59",
-    },
-
-    "facewear": {
-        "#111217",
-        "#4a3024",
-        "#b8bdc4",
-        "#d4af37",
-    },
-
-    "neckwear": {
+AVATAR_LIMITED_COLOR_STOPS = {
+    "neckwear": [
         "#d4af37",
         "#c2c6cc",
         "#9a6a3a",
         "#6f4a2e",
-    },
+    ],
 }
 
 AVATAR_DEFAULT_CONFIG = {
@@ -347,6 +323,134 @@ def safe_hex_color(value, fallback):
 
     return fallback
 
+def hex_to_rgb_tuple(value: str):
+    clean = str(value or "").strip().lower()
+
+    if not re.fullmatch(r"#[0-9a-f]{6}", clean):
+        return (255, 255, 255)
+
+    return (
+        int(clean[1:3], 16),
+        int(clean[3:5], 16),
+        int(clean[5:7], 16),
+    )
+
+
+def rgb_tuple_to_hex(rgb):
+    values = []
+
+    for value in rgb:
+        values.append(
+            max(
+                0,
+                min(
+                    255,
+                    int(round(value)),
+                ),
+            )
+        )
+
+    return "#{:02x}{:02x}{:02x}".format(
+        values[0],
+        values[1],
+        values[2],
+    )
+
+
+def snap_hex_to_palette_gradient(
+    value: str,
+    palette: list[str],
+    fallback: str,
+):
+    candidate = safe_hex_color(
+        value,
+        fallback,
+    )
+
+    colors = [
+        hex_to_rgb_tuple(color)
+        for color in (palette or [])
+        if re.fullmatch(
+            r"#[0-9a-f]{6}",
+            str(color or "").strip().lower(),
+        )
+    ]
+
+    if not colors:
+        return candidate
+
+    if len(colors) == 1:
+        return rgb_tuple_to_hex(
+            colors[0]
+        )
+
+    target = hex_to_rgb_tuple(
+        candidate
+    )
+
+    best_rgb = colors[0]
+    best_distance = None
+
+    for index in range(
+        len(colors) - 1
+    ):
+        a = colors[index]
+        b = colors[index + 1]
+
+        vx = b[0] - a[0]
+        vy = b[1] - a[1]
+        vz = b[2] - a[2]
+
+        wx = target[0] - a[0]
+        wy = target[1] - a[1]
+        wz = target[2] - a[2]
+
+        length_squared = (
+            (vx * vx)
+            + (vy * vy)
+            + (vz * vz)
+        )
+
+        if length_squared > 0:
+            t = (
+                (wx * vx)
+                + (wy * vy)
+                + (wz * vz)
+            ) / length_squared
+        else:
+            t = 0.0
+
+        t = max(
+            0.0,
+            min(
+                1.0,
+                t,
+            ),
+        )
+
+        projected = (
+            a[0] + (vx * t),
+            a[1] + (vy * t),
+            a[2] + (vz * t),
+        )
+
+        distance = (
+            (target[0] - projected[0]) ** 2
+            + (target[1] - projected[1]) ** 2
+            + (target[2] - projected[2]) ** 2
+        )
+
+        if (
+            best_distance is None
+            or distance < best_distance
+        ):
+            best_distance = distance
+            best_rgb = projected
+
+    return rgb_tuple_to_hex(
+        best_rgb
+    )
+
 
 def safe_avatar_id(value, fallback):
     value = str(value or "").strip().lower()
@@ -389,12 +493,23 @@ def clean_avatar_config(value, user_id: str | None = None):
             fallback,
         )
 
-        allowed_values = AVATAR_LIMITED_COLOR_VALUES.get(key)
+        limited_palette = (
+            AVATAR_LIMITED_COLOR_STOPS.get(
+                key
+            )
+        )
+
+        if limited_palette:
+            candidate = (
+                snap_hex_to_palette_gradient(
+                    candidate,
+                    limited_palette,
+                    fallback,
+                )
+            )
 
         clean["colors"][key] = (
             candidate
-            if not allowed_values or candidate in allowed_values
-            else fallback
         )
 
     parts = (
@@ -1684,7 +1799,7 @@ def record_avatar_badge_unlock(
                 user_id,
                 None,
                 f"badge_unlock:{badge_id}",
-                f"Badge unlocked: {meta['name']}",
+                f"Badge unlocked: {re.sub(r'\s+Badge$', '', meta['name'])}",
                 (
                     f"{meta['unlock_description']} "
                     "Tap to equip it in Avatar Customization."
@@ -2113,10 +2228,20 @@ def home_feed():
         gym, _membership = get_my_gym_membership(uid)
 
         if gym:
+            gym_post_cutoff = (
+                purge_expired_gym_posts(
+                    gym["id"]
+                )
+            )
+
             gym_posts_res = (
                 supabase.table("gym_posts")
                 .select("*")
                 .eq("gym_id", gym["id"])
+                .gte(
+                    "created_at",
+                    gym_post_cutoff,
+                )
                 .in_("kind", ["session", "system"])
                 .order("created_at", desc=True)
                 .limit(10)
@@ -3542,6 +3667,42 @@ def load_gym_members(gym_id: str):
         return []
 
 
+def gym_post_cutoff_iso():
+    return (
+        datetime.now(timezone.utc)
+        - timedelta(days=GYM_POST_RETENTION_DAYS)
+    ).isoformat()
+
+
+def purge_expired_gym_posts(
+    gym_id: str | None = None,
+):
+    cutoff = gym_post_cutoff_iso()
+
+    try:
+        query = (
+            supabase
+            .table("gym_posts")
+            .delete()
+            .lt("created_at", cutoff)
+        )
+
+        if gym_id:
+            query = query.eq(
+                "gym_id",
+                gym_id,
+            )
+
+        query.execute()
+
+    except Exception as e:
+        print(
+            "[gym-retention] purge failed "
+            f"gym={gym_id or 'all'}: {e}"
+        )
+
+    return cutoff
+
 def safe_gym_post(row: dict, profiles_by_id: dict, session_posts_by_id: dict | None = None):
     author_id = str(row.get("user_id") or "")
     profile = profiles_by_id.get(author_id) or normalize_profile({"id": author_id})
@@ -3564,10 +3725,15 @@ def safe_gym_post(row: dict, profiles_by_id: dict, session_posts_by_id: dict | N
 
 
 def load_gym_posts(gym_id: str, viewer_id: str):
+    cutoff = purge_expired_gym_posts(
+        gym_id
+    )
+
     posts_res = (
         supabase.table("gym_posts")
         .select("*")
         .eq("gym_id", gym_id)
+        .gte("created_at", cutoff)
         .order("created_at", desc=True)
         .limit(30)
         .execute()
