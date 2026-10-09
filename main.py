@@ -37,6 +37,24 @@ GUEST_GENERATE_COOLDOWN_SECONDS = 15
 GYM_POST_RETENTION_DAYS = 10
 _guest_last_generate_by_ip = {}
 
+DEVELOPER_USER_IDS = {
+    "8c2fe150-4d87-4622-8b8a-42b6e572a016",
+}
+
+PROMO_BENEFIT_TYPES = {
+    "pro_forever",
+    "pro_days",
+    "discount_percent",
+    "discount_fixed_cents",
+}
+
+
+def is_developer_user(user_id: str | None):
+    return bool(
+        user_id
+        and str(user_id) in DEVELOPER_USER_IDS
+    )
+
 
 def normalize_plan(payload: dict):
     difficulty = (payload.get("difficulty") or "beginner").strip().lower()
@@ -652,20 +670,210 @@ def get_client_ip():
         return forwarded.split(",")[0].strip()
     return (request.remote_addr or "").strip() or "unknown"
 
-def get_plan_tier(user_id: str):
-    """
-    Read profiles.plan_tier for the user.
-    Defaults to 'free' if missing.
-    """
-    if not user_id:
-        return "free"
+def parse_utc_datetime(value):
+    if not value:
+        return None
+
     try:
-        res = supabase.table("profiles").select("plan_tier").eq("id", user_id).limit(1).execute()
-        if res.data and isinstance(res.data[0], dict):
-            return (res.data[0].get("plan_tier") or "free").strip().lower()
-        return "free"
+        parsed = datetime.fromisoformat(
+            str(value).replace(
+                "Z",
+                "+00:00",
+            )
+        )
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(
+                tzinfo=timezone.utc
+            )
+
+        return parsed.astimezone(
+            timezone.utc
+        )
+
     except Exception:
-        return "free"
+        return None
+
+
+def get_effective_plan(
+    user_id: str | None,
+):
+    if not user_id:
+        return {
+            "plan_tier": "free",
+            "source": "guest",
+            "pro_expires_at": None,
+            "promo_code_id": None,
+        }
+
+    base_tier = "free"
+
+    try:
+        profile_res = (
+            supabase
+            .table("profiles")
+            .select("plan_tier")
+            .eq("id", user_id)
+            .limit(1)
+            .execute()
+        )
+
+        if (
+            profile_res.data
+            and isinstance(
+                profile_res.data[0],
+                dict,
+            )
+        ):
+            base_tier = str(
+                profile_res.data[0]
+                .get("plan_tier")
+                or "free"
+            ).strip().lower()
+
+    except Exception:
+        base_tier = "free"
+
+    if base_tier == "pro":
+        return {
+            "plan_tier": "pro",
+            "source": "profile",
+            "pro_expires_at": None,
+            "promo_code_id": None,
+        }
+
+    try:
+        entitlement_res = (
+            supabase
+            .table("promo_entitlements")
+            .select(
+                "id,"
+                "promo_code_id,"
+                "entitlement_type,"
+                "starts_at,"
+                "ends_at,"
+                "revoked_at,"
+                "created_at"
+            )
+            .eq(
+                "user_id",
+                user_id,
+            )
+            .execute()
+        )
+
+        now = datetime.now(
+            timezone.utc
+        )
+
+        active_rows = []
+
+        for row in (
+            entitlement_res.data
+            or []
+        ):
+            if row.get("revoked_at"):
+                continue
+
+            if (
+                str(
+                    row.get(
+                        "entitlement_type"
+                    )
+                    or ""
+                ).lower()
+                != "pro"
+            ):
+                continue
+
+            starts_at = (
+                parse_utc_datetime(
+                    row.get("starts_at")
+                )
+                or now
+            )
+
+            ends_at = (
+                parse_utc_datetime(
+                    row.get("ends_at")
+                )
+            )
+
+            if starts_at > now:
+                continue
+
+            if (
+                ends_at is not None
+                and ends_at <= now
+            ):
+                continue
+
+            active_rows.append(
+                {
+                    **row,
+                    "_starts_at": starts_at,
+                    "_ends_at": ends_at,
+                }
+            )
+
+        if active_rows:
+            permanent = next(
+                (
+                    row
+                    for row in active_rows
+                    if row["_ends_at"]
+                    is None
+                ),
+                None,
+            )
+
+            if permanent:
+                selected = permanent
+            else:
+                selected = max(
+                    active_rows,
+                    key=lambda row:
+                        row["_ends_at"],
+                )
+
+            expires_at = (
+                selected["_ends_at"]
+                .isoformat()
+                if selected["_ends_at"]
+                else None
+            )
+
+            return {
+                "plan_tier": "pro",
+                "source": "promo",
+                "pro_expires_at": expires_at,
+                "promo_code_id":
+                    selected.get(
+                        "promo_code_id"
+                    ),
+            }
+
+    except Exception:
+        pass
+
+    return {
+        "plan_tier": "free",
+        "source": "free",
+        "pro_expires_at": None,
+        "promo_code_id": None,
+    }
+
+
+def get_plan_tier(user_id: str):
+    return (
+        get_effective_plan(
+            user_id
+        )
+        .get(
+            "plan_tier",
+            "free",
+        )
+    )
 
 def get_active_job_for_user(user_id: str):
     """
@@ -744,19 +952,59 @@ def whoami():
 
 @app.route("/me", methods=["GET"])
 def me():
-    uid = get_verified_user_id_from_request()
-    if not uid:
-        return jsonify({"signed_in": False}), 200
+    uid = (
+        get_verified_user_id_from_request()
+    )
 
-    row = ensure_profile_row(uid)
-    plan_tier = ((row.get("plan_tier") if row else None) or "free").strip().lower()
+    if not uid:
+        return jsonify({
+            "signed_in": False,
+        }), 200
+
+    row = ensure_profile_row(
+        uid
+    )
+
+    effective_plan = (
+        get_effective_plan(
+            uid
+        )
+    )
 
     return jsonify({
         "signed_in": True,
         "user_id": uid,
-        "plan_tier": plan_tier,
-        "profile": profile_payload(row, uid),
-        "profile_complete": profile_is_complete(row),
+
+        "plan_tier":
+            effective_plan[
+                "plan_tier"
+            ],
+
+        "plan_source":
+            effective_plan[
+                "source"
+            ],
+
+        "pro_expires_at":
+            effective_plan[
+                "pro_expires_at"
+            ],
+
+        "is_developer":
+            is_developer_user(
+                uid
+            ),
+
+        "profile":
+            profile_payload(
+                row,
+                uid,
+            ),
+
+        "profile_complete":
+            profile_is_complete(
+                row
+            ),
     }), 200
 
 @app.route("/me/profile", methods=["PATCH"])
@@ -935,12 +1183,31 @@ def generate():
                     "retry_after_seconds": max(1, remaining),
                 }), 429
 
-        # 2) Determine tier
-        #    - Guest => demo
-        #    - Logged in, not pro => demo
-        #    - Pro => full
-        plan_tier = get_plan_tier(user_id) if user_id else "free"
-        is_pro = (plan_tier == "pro")
+        # 2) Determine EFFECTIVE tier.
+        #    Permanent/paid Pro and active
+        #    promo Pro both count.
+        effective_plan = (
+            get_effective_plan(
+                user_id
+            )
+            if user_id
+            else {
+                "plan_tier": "free",
+                "source": "guest",
+                "pro_expires_at": None,
+            }
+        )
+
+        plan_tier = (
+            effective_plan.get(
+                "plan_tier",
+                "free",
+            )
+        )
+
+        is_pro = (
+            plan_tier == "pro"
+        )
 
         # 2.5) Signed-in users may only have one active job at a time
         if user_id:
@@ -1039,8 +1306,25 @@ def generate():
             "status": "queued",
             "job_id": str(job_id),
             "user_id": user_id,
-            "class_mode": class_mode,
-            "plan_tier": plan_tier if user_id else "guest",
+
+            "class_mode":
+                class_mode,
+
+            "plan_tier":
+                plan_tier
+                if user_id
+                else "guest",
+
+            "plan_source":
+                effective_plan.get(
+                    "source",
+                    "guest",
+                ),
+
+            "pro_expires_at":
+                effective_plan.get(
+                    "pro_expires_at"
+                ),
         }), 202
 
     except Exception as e:
@@ -1063,6 +1347,749 @@ def require_user_id():
             "error": "Unauthorized",
         }), 401)
     return uid, None
+
+def require_developer_user_id():
+    uid, err = require_user_id()
+
+    if err:
+        return None, err
+
+    if not is_developer_user(uid):
+        return None, (
+            jsonify({
+                "status": "error",
+                "error": "Developer access required.",
+            }),
+            403,
+        )
+
+    return uid, None
+
+
+def normalize_promo_code(value):
+    return re.sub(
+        r"\s+",
+        "",
+        str(value or "")
+        .strip()
+        .upper(),
+    )
+
+
+def promo_int(
+    value,
+    default=0,
+):
+    try:
+        if value in (
+            None,
+            "",
+        ):
+            return default
+
+        return int(value)
+
+    except Exception:
+        return default
+
+
+def promo_datetime_text(
+    value,
+):
+    if value in (
+        None,
+        "",
+    ):
+        return None
+
+    parsed = parse_utc_datetime(
+        value
+    )
+
+    if not parsed:
+        raise ValueError(
+            "Invalid date/time."
+        )
+
+    return parsed.isoformat()
+
+
+def promo_benefit_is_valid(
+    benefit_type,
+    benefit_value,
+):
+    if benefit_type == "pro_forever":
+        return benefit_value == 0
+
+    if benefit_type == "pro_days":
+        return (
+            1
+            <= benefit_value
+            <= 3650
+        )
+
+    if benefit_type == "discount_percent":
+        return (
+            1
+            <= benefit_value
+            <= 100
+        )
+
+    if benefit_type == "discount_fixed_cents":
+        return (
+            1
+            <= benefit_value
+            <= 1000000
+        )
+
+    return False
+
+
+@app.route(
+    "/promo/redeem",
+    methods=["POST"],
+)
+def redeem_promo():
+    uid, err = require_user_id()
+
+    if err:
+        return err
+
+    data = (
+        request.get_json(
+            force=True,
+            silent=True,
+        )
+        or {}
+    )
+
+    code = normalize_promo_code(
+        data.get("code")
+    )
+
+    if not re.fullmatch(
+        r"[A-Z0-9][A-Z0-9_-]{2,31}",
+        code,
+    ):
+        return jsonify({
+            "status": "error",
+            "error": "Enter a valid promo code.",
+        }), 400
+
+    try:
+        rpc_res = (
+            supabase
+            .rpc(
+                "redeem_corner_promo",
+                {
+                    "p_user_id": uid,
+                    "p_code": code,
+                },
+            )
+            .execute()
+        )
+
+        result = rpc_res.data
+
+        if (
+            isinstance(
+                result,
+                list,
+            )
+            and result
+        ):
+            result = result[0]
+
+        if isinstance(
+            result,
+            str,
+        ):
+            try:
+                result = json.loads(
+                    result
+                )
+            except Exception:
+                result = None
+
+        if not isinstance(
+            result,
+            dict,
+        ):
+            return jsonify({
+                "status": "error",
+                "error":
+                    "Promo redemption failed.",
+            }), 500
+
+        if (
+            result.get("status")
+            != "ok"
+        ):
+            error_code = str(
+                result.get("error")
+                or "invalid_code"
+            )
+
+            messages = {
+                "invalid_code":
+                    "That promo code does not exist.",
+
+                "inactive_code":
+                    "That promo code is no longer active.",
+
+                "not_started":
+                    "That promo code is not active yet.",
+
+                "expired_code":
+                    "That promo code has expired.",
+
+                "redemption_limit_reached":
+                    "That promo code has reached its redemption limit.",
+
+                "already_redeemed":
+                    "You have already used that promo code.",
+            }
+
+            status_code = (
+                409
+                if error_code in {
+                    "redemption_limit_reached",
+                    "already_redeemed",
+                }
+                else 400
+            )
+
+            return jsonify({
+                "status": "error",
+                "error":
+                    messages.get(
+                        error_code,
+                        "Promo code could not be redeemed.",
+                    ),
+                "code":
+                    error_code,
+            }), status_code
+
+        effective_plan = (
+            get_effective_plan(
+                uid
+            )
+        )
+
+        benefit_type = str(
+            result.get(
+                "benefit_type"
+            )
+            or ""
+        )
+
+        benefit_value = promo_int(
+            result.get(
+                "benefit_value"
+            ),
+            0,
+        )
+
+        if benefit_type == "pro_forever":
+            message = (
+                "Promo applied. "
+                "Your account now has Pro access."
+            )
+
+        elif benefit_type == "pro_days":
+            message = (
+                "Promo applied. "
+                f"You received {benefit_value} "
+                "days of Pro access."
+            )
+
+        elif benefit_type == "discount_percent":
+            message = (
+                "Promo saved. "
+                f"{benefit_value}% off is now "
+                "attached to your account for "
+                "future Pro checkout."
+            )
+
+        elif benefit_type == "discount_fixed_cents":
+            message = (
+                "Promo saved. "
+                f"${benefit_value / 100:.2f} off "
+                "is now attached to your account "
+                "for future Pro checkout."
+            )
+
+        else:
+            message = (
+                "Promo applied successfully."
+            )
+
+        return jsonify({
+            "status": "ok",
+            "message": message,
+
+            "benefit_type":
+                benefit_type,
+
+            "benefit_value":
+                benefit_value,
+
+            "plan_tier":
+                effective_plan[
+                    "plan_tier"
+                ],
+
+            "plan_source":
+                effective_plan[
+                    "source"
+                ],
+
+            "pro_expires_at":
+                effective_plan[
+                    "pro_expires_at"
+                ],
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error":
+                "Could not redeem promo code.",
+            "details":
+                str(e),
+        }), 500
+
+
+@app.route(
+    "/admin/promo-codes",
+    methods=["GET", "POST"],
+)
+def admin_promo_codes():
+    uid, err = (
+        require_developer_user_id()
+    )
+
+    if err:
+        return err
+
+    if request.method == "GET":
+        try:
+            codes_res = (
+                supabase
+                .table("promo_codes")
+                .select("*")
+                .order(
+                    "created_at",
+                    desc=True,
+                )
+                .limit(100)
+                .execute()
+            )
+
+            redemptions_res = (
+                supabase
+                .table("promo_redemptions")
+                .select("promo_code_id")
+                .execute()
+            )
+
+            counts = {}
+
+            for row in (
+                redemptions_res.data
+                or []
+            ):
+                promo_id = str(
+                    row.get(
+                        "promo_code_id"
+                    )
+                    or ""
+                )
+
+                counts[promo_id] = (
+                    counts.get(
+                        promo_id,
+                        0,
+                    )
+                    + 1
+                )
+
+            items = []
+
+            for row in (
+                codes_res.data
+                or []
+            ):
+                promo_id = str(
+                    row.get("id")
+                    or ""
+                )
+
+                items.append({
+                    **row,
+                    "redemption_count":
+                        counts.get(
+                            promo_id,
+                            0,
+                        ),
+                })
+
+            return jsonify({
+                "status": "ok",
+                "items": items,
+            }), 200
+
+        except Exception as e:
+            return jsonify({
+                "status": "error",
+                "error":
+                    "Could not load promo codes.",
+                "details":
+                    str(e),
+            }), 500
+
+
+    data = (
+        request.get_json(
+            force=True,
+            silent=True,
+        )
+        or {}
+    )
+
+    code = normalize_promo_code(
+        data.get("code")
+    )
+
+    if not re.fullmatch(
+        r"[A-Z0-9][A-Z0-9_-]{2,31}",
+        code,
+    ):
+        return jsonify({
+            "status": "error",
+            "error":
+                "Promo code must be 3-32 characters using letters, numbers, - or _.",
+        }), 400
+
+    label = str(
+        data.get("label")
+        or ""
+    ).strip()[:80]
+
+    benefit_type = str(
+        data.get(
+            "benefit_type"
+        )
+        or ""
+    ).strip().lower()
+
+    if (
+        benefit_type
+        not in PROMO_BENEFIT_TYPES
+    ):
+        return jsonify({
+            "status": "error",
+            "error":
+                "Invalid promo benefit type.",
+        }), 400
+
+    benefit_value = promo_int(
+        data.get(
+            "benefit_value"
+        ),
+        0,
+    )
+
+    if benefit_type == "pro_forever":
+        benefit_value = 0
+
+    if not promo_benefit_is_valid(
+        benefit_type,
+        benefit_value,
+    ):
+        return jsonify({
+            "status": "error",
+            "error":
+                "Invalid benefit value.",
+        }), 400
+
+    max_redemptions = promo_int(
+        data.get(
+            "max_redemptions"
+        ),
+        0,
+    )
+
+    if max_redemptions <= 0:
+        max_redemptions = None
+
+    max_per_user = max(
+        1,
+        promo_int(
+            data.get(
+                "max_redemptions_per_user"
+            ),
+            1,
+        ),
+    )
+
+    try:
+        starts_at = (
+            promo_datetime_text(
+                data.get("starts_at")
+            )
+        )
+
+        ends_at = (
+            promo_datetime_text(
+                data.get("ends_at")
+            )
+        )
+
+    except ValueError as e:
+        return jsonify({
+            "status": "error",
+            "error": str(e),
+        }), 400
+
+    if (
+        starts_at
+        and ends_at
+        and parse_utc_datetime(
+            ends_at
+        )
+        <= parse_utc_datetime(
+            starts_at
+        )
+    ):
+        return jsonify({
+            "status": "error",
+            "error":
+                "End time must be after start time.",
+        }), 400
+
+    stripe_coupon_id = str(
+        data.get(
+            "stripe_coupon_id"
+        )
+        or ""
+    ).strip()[:128]
+
+    try:
+        existing = (
+            supabase
+            .table("promo_codes")
+            .select("id")
+            .eq(
+                "code",
+                code,
+            )
+            .limit(1)
+            .execute()
+        )
+
+        if existing.data:
+            return jsonify({
+                "status": "error",
+                "error":
+                    "That promo code already exists.",
+            }), 409
+
+        payload = {
+            "code":
+                code,
+
+            "label":
+                label,
+
+            "active":
+                True,
+
+            "benefit_type":
+                benefit_type,
+
+            "benefit_value":
+                benefit_value,
+
+            "starts_at":
+                starts_at,
+
+            "ends_at":
+                ends_at,
+
+            "max_redemptions":
+                max_redemptions,
+
+            "max_redemptions_per_user":
+                max_per_user,
+
+            "created_by":
+                uid,
+
+            "stripe_coupon_id":
+                (
+                    stripe_coupon_id
+                    or None
+                ),
+
+            "updated_at":
+                utc_now_iso(),
+        }
+
+        insert_res = (
+            supabase
+            .table("promo_codes")
+            .insert(payload)
+            .execute()
+        )
+
+        if not insert_res.data:
+            return jsonify({
+                "status": "error",
+                "error":
+                    "Promo code creation returned no row.",
+            }), 500
+
+        return jsonify({
+            "status": "ok",
+            "promo":
+                insert_res.data[0],
+        }), 201
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error":
+                "Could not create promo code.",
+            "details":
+                str(e),
+        }), 500
+
+
+@app.route(
+    "/admin/promo-codes/<promo_id>",
+    methods=["PATCH"],
+)
+def admin_update_promo_code(
+    promo_id,
+):
+    uid, err = (
+        require_developer_user_id()
+    )
+
+    if err:
+        return err
+
+    data = (
+        request.get_json(
+            force=True,
+            silent=True,
+        )
+        or {}
+    )
+
+    payload = {}
+
+    if "active" in data:
+        payload["active"] = bool(
+            data.get("active")
+        )
+
+    if "label" in data:
+        payload["label"] = str(
+            data.get("label")
+            or ""
+        ).strip()[:80]
+
+    if "ends_at" in data:
+        try:
+            payload["ends_at"] = (
+                promo_datetime_text(
+                    data.get("ends_at")
+                )
+            )
+        except ValueError as e:
+            return jsonify({
+                "status": "error",
+                "error": str(e),
+            }), 400
+
+    if "max_redemptions" in data:
+        max_redemptions = promo_int(
+            data.get(
+                "max_redemptions"
+            ),
+            0,
+        )
+
+        payload[
+            "max_redemptions"
+        ] = (
+            max_redemptions
+            if max_redemptions > 0
+            else None
+        )
+
+    if (
+        "max_redemptions_per_user"
+        in data
+    ):
+        payload[
+            "max_redemptions_per_user"
+        ] = max(
+            1,
+            promo_int(
+                data.get(
+                    "max_redemptions_per_user"
+                ),
+                1,
+            ),
+        )
+
+    if not payload:
+        return jsonify({
+            "status": "error",
+            "error":
+                "No promo changes supplied.",
+        }), 400
+
+    payload["updated_at"] = (
+        utc_now_iso()
+    )
+
+    try:
+        res = (
+            supabase
+            .table("promo_codes")
+            .update(payload)
+            .eq(
+                "id",
+                promo_id,
+            )
+            .execute()
+        )
+
+        if not res.data:
+            return jsonify({
+                "status": "error",
+                "error":
+                    "Promo code not found.",
+            }), 404
+
+        return jsonify({
+            "status": "ok",
+            "promo":
+                res.data[0],
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status": "error",
+            "error":
+                "Could not update promo code.",
+            "details":
+                str(e),
+        }), 500
 
 
 def profile_display_name(profile: dict | None, fallback: str = "Corner athlete"):
