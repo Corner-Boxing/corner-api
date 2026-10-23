@@ -48,6 +48,70 @@ PROMO_BENEFIT_TYPES = {
     "discount_fixed_cents",
 }
 
+BANNER_OVERLAY_OPTIONS = {
+    "none",
+    "abstract",
+    "blocky",
+    "fabric",
+    "gritty",
+    "ringside",
+    "stripes",
+    "tiger",
+    "wave",
+}
+
+GYM_BADGE_BORDER_OPTIONS = {
+    "none",
+    "basic",
+    "broken",
+    "double",
+}
+
+GYM_BADGE_ICON_OPTIONS = {
+    "none",
+    "bag",
+    "bell",
+    "bolt",
+    "champs",
+    "corner",
+    "eagle",
+    "fist",
+    "flame",
+    "flight",
+    "glove",
+    "heart",
+    "iron",
+    "king",
+    "lion",
+    "shield",
+    "skull",
+    "star",
+    "summit",
+    "target",
+    "wild",
+}
+
+DEFAULT_PROFILE_BANNER_CONFIG = {
+    "base_color": "#101114",
+    "overlay": "ringside",
+    "overlay_color": "#e63946",
+    "overlay_opacity": 38,
+}
+
+DEFAULT_GYM_BANNER_CONFIG = {
+    "base_color": "#101114",
+    "overlay": "fabric",
+    "overlay_color": "#d4af37",
+    "overlay_opacity": 32,
+}
+
+DEFAULT_GYM_BADGE_CONFIG = {
+    "base_color": "#111214",
+    "border": "double",
+    "border_color": "#d4af37",
+    "icon": "corner",
+    "icon_color": "#f6f6f6",
+}
 
 def is_developer_user(user_id: str | None):
     return bool(
@@ -340,6 +404,48 @@ def safe_hex_color(value, fallback):
         return value
 
     return fallback
+
+def normalize_banner_config(value, fallback=None):
+    base = dict(fallback or DEFAULT_PROFILE_BANNER_CONFIG)
+    raw = safe_json_value(value, {}) if value is not None else {}
+
+    overlay = str(raw.get("overlay") or base["overlay"]).strip().lower()
+    if overlay not in BANNER_OVERLAY_OPTIONS:
+        overlay = base["overlay"]
+
+    try:
+        overlay_opacity = int(raw.get("overlay_opacity", base["overlay_opacity"]))
+    except Exception:
+        overlay_opacity = base["overlay_opacity"]
+
+    overlay_opacity = max(0, min(100, overlay_opacity))
+
+    return {
+        "base_color": safe_hex_color(raw.get("base_color"), base["base_color"]),
+        "overlay": overlay,
+        "overlay_color": safe_hex_color(raw.get("overlay_color"), base["overlay_color"]),
+        "overlay_opacity": overlay_opacity,
+    }
+
+
+def normalize_gym_badge_config(value):
+    raw = safe_json_value(value, {}) if value is not None else {}
+
+    border = str(raw.get("border") or DEFAULT_GYM_BADGE_CONFIG["border"]).strip().lower()
+    if border not in GYM_BADGE_BORDER_OPTIONS:
+        border = DEFAULT_GYM_BADGE_CONFIG["border"]
+
+    icon = str(raw.get("icon") or DEFAULT_GYM_BADGE_CONFIG["icon"]).strip().lower()
+    if icon not in GYM_BADGE_ICON_OPTIONS:
+        icon = DEFAULT_GYM_BADGE_CONFIG["icon"]
+
+    return {
+        "base_color": safe_hex_color(raw.get("base_color"), DEFAULT_GYM_BADGE_CONFIG["base_color"]),
+        "border": border,
+        "border_color": safe_hex_color(raw.get("border_color"), DEFAULT_GYM_BADGE_CONFIG["border_color"]),
+        "icon": icon,
+        "icon_color": safe_hex_color(raw.get("icon_color"), DEFAULT_GYM_BADGE_CONFIG["icon_color"]),
+    }
 
 def hex_to_rgb_tuple(value: str):
     clean = str(value or "").strip().lower()
@@ -1024,6 +1130,11 @@ def update_my_profile():
     if account_privacy not in ("public", "private"):
         account_privacy = "public"
 
+    banner_config = normalize_banner_config(
+        data.get("banner_config"),
+        DEFAULT_PROFILE_BANNER_CONFIG,
+    )
+
     if not display_name or len(display_name) > 40:
         return jsonify({
             "status": "error",
@@ -1081,6 +1192,7 @@ def update_my_profile():
         "bio": bio,
         "avatar_url": avatar_url,
         "account_privacy": account_privacy,
+        "banner_config": banner_config,
         "updated_at": utc_now_iso(),
     }
 
@@ -2116,6 +2228,10 @@ def normalize_profile(row: dict | None):
         account_privacy = "public"
 
     avatar_config = clean_avatar_config(row.get("avatar_config"))
+    banner_config = normalize_banner_config(
+        row.get("banner_config"),
+        DEFAULT_PROFILE_BANNER_CONFIG,
+    )
 
     return {
         "id": row.get("id"),
@@ -2127,6 +2243,7 @@ def normalize_profile(row: dict | None):
         "avatar_version": row.get("avatar_version") or AVATAR_VERSION,
         "avatar_updated_at": row.get("avatar_updated_at"),
         "account_privacy": account_privacy,
+        "banner_config": banner_config,
     }
 
 
@@ -2138,7 +2255,7 @@ def load_profiles_map(user_ids: list[str]):
     try:
         res = (
             supabase.table("profiles")
-            .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at")
+            .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at,banner_config")
             .in_("id", clean_ids)
             .execute()
         )
@@ -2300,6 +2417,11 @@ def normalize_gym(row: dict | None, membership: dict | None = None):
         "description": row.get("description") or "",
         "badge_url": row.get("badge_url") or "assets/gyms/default-gym-badge.png",
         "banner_url": row.get("banner_url") or "assets/gyms/default-gym-banner.jpg",
+        "badge_config": normalize_gym_badge_config(row.get("badge_config")),
+        "banner_config": normalize_banner_config(
+            row.get("banner_config"),
+            DEFAULT_GYM_BANNER_CONFIG,
+        ),
         "visibility": row.get("visibility") or "public",
         "owner_id": row.get("owner_id"),
         "member_count": safe_int(row.get("member_count"), 0) or count_gym_members(gym_id),
@@ -2307,7 +2429,7 @@ def normalize_gym(row: dict | None, membership: dict | None = None):
         "updated_at": row.get("updated_at"),
         "my_role": membership.get("role") if membership else None,
         "joined_at": membership.get("joined_at") if membership else None,
-    }
+    }    
 
 
 def profile_payload(profile: dict | None, viewer_id: str | None = None):
@@ -4903,6 +5025,13 @@ def create_gym():
     name = str(data.get("name") or "").strip()
     description = str(data.get("description") or "").strip()
     visibility = str(data.get("visibility") or "public").strip().lower()
+    banner_config = normalize_banner_config(
+        data.get("banner_config"),
+        DEFAULT_GYM_BANNER_CONFIG,
+    )
+    badge_config = normalize_gym_badge_config(
+        data.get("badge_config")
+    )
 
     if not name or len(name) > 40:
         return jsonify({
@@ -4952,6 +5081,8 @@ def create_gym():
             "visibility": visibility,
             "badge_url": "assets/gyms/default-gym-badge.png",
             "banner_url": "assets/gyms/default-gym-banner.jpg",
+            "badge_config": badge_config,
+            "banner_config": banner_config,
             "member_count": 1,
             "created_at": utc_now_iso(),
             "updated_at": utc_now_iso(),
@@ -5042,6 +5173,13 @@ def update_gym(gym_id):
     name = str(data.get("name") or "").strip()
     description = str(data.get("description") or "").strip()
     visibility = str(data.get("visibility") or "public").strip().lower()
+    banner_config = normalize_banner_config(
+        data.get("banner_config"),
+        DEFAULT_GYM_BANNER_CONFIG,
+    )
+    badge_config = normalize_gym_badge_config(
+        data.get("badge_config")
+    )
 
     if not name or len(name) > 40:
         return jsonify({
@@ -5065,6 +5203,8 @@ def update_gym(gym_id):
                 "name": name,
                 "description": description,
                 "visibility": visibility,
+                "banner_config": banner_config,
+                "badge_config": badge_config,
                 "updated_at": utc_now_iso(),
             })
             .eq("id", gym_id)
