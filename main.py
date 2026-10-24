@@ -335,6 +335,7 @@ AVATAR_ALLOWED_OPTIONS = {
     "badge": {
         "none",
         "corner-badge",
+        "gym-badge",
         *AVATAR_ACHIEVEMENT_BADGES.keys(),
     },
 }
@@ -692,6 +693,16 @@ def clean_avatar_config(value, user_id: str | None = None):
         except Exception:
             clean["parts"]["badge"] = "none"
 
+    if (
+        selected_badge == "gym-badge"
+        and user_id
+    ):
+        try:
+            if not get_user_primary_gym(user_id):
+                clean["parts"]["badge"] = "none"
+        except Exception:
+            clean["parts"]["badge"] = "none"
+
     clean["version"] = AVATAR_VERSION
 
     return clean
@@ -702,7 +713,7 @@ def ensure_profile_row(user_id: str):
 
     res = (
         supabase.table("profiles")
-        .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at,plan_tier,subscription_status,tier_updated_at,created_at,updated_at")
+        .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at,banner_config,plan_tier,subscription_status,tier_updated_at,created_at,updated_at")
         .eq("id", user_id)
         .limit(1)
         .execute()
@@ -742,7 +753,7 @@ def ensure_profile_row(user_id: str):
     # Race-condition fallback: if another request created it first, read again.
     retry = (
         supabase.table("profiles")
-        .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at,plan_tier,subscription_status,tier_updated_at,created_at,updated_at")
+        .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at,banner_config,plan_tier,subscription_status,tier_updated_at,created_at,updated_at")
         .eq("id", user_id)
         .limit(1)
         .execute()
@@ -2227,23 +2238,57 @@ def normalize_profile(row: dict | None):
     if account_privacy not in ("public", "private"):
         account_privacy = "public"
 
-    avatar_config = clean_avatar_config(row.get("avatar_config"))
+    avatar_config = clean_avatar_config(
+        row.get("avatar_config")
+    )
+
     banner_config = normalize_banner_config(
         row.get("banner_config"),
         DEFAULT_PROFILE_BANNER_CONFIG,
     )
 
+    avatar_primary_gym = None
+
+    if (
+        row.get("id")
+        and avatar_config
+            .get("parts", {})
+            .get("badge")
+            == "gym-badge"
+    ):
+        try:
+            avatar_primary_gym = (
+                get_user_primary_gym(
+                    str(row.get("id"))
+                )
+            )
+        except Exception:
+            avatar_primary_gym = None
+
     return {
         "id": row.get("id"),
         "username": username,
-        "display_name": display_name or username or "Corner athlete",
+        "display_name": (
+            display_name
+            or username
+            or "Corner athlete"
+        ),
         "bio": row.get("bio") or "",
-        "avatar_url": row.get("avatar_url") or "",
+        "avatar_url": (
+            row.get("avatar_url")
+            or ""
+        ),
         "avatar_config": avatar_config,
-        "avatar_version": row.get("avatar_version") or AVATAR_VERSION,
-        "avatar_updated_at": row.get("avatar_updated_at"),
+        "avatar_version": (
+            row.get("avatar_version")
+            or AVATAR_VERSION
+        ),
+        "avatar_updated_at": (
+            row.get("avatar_updated_at")
+        ),
         "account_privacy": account_privacy,
         "banner_config": banner_config,
+        "primary_gym": avatar_primary_gym,
     }
 
 
@@ -3613,7 +3658,7 @@ def home_suggestions():
 
         res = (
             supabase.table("profiles")
-            .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at")
+            .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at,banner_config")
             .neq("id", uid)
             .limit(30)
             .execute()
@@ -4017,7 +4062,7 @@ def profile_posts(profile_id):
 
         profile_res = (
             supabase.table("profiles")
-            .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at")
+            .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at,banner_config")
             .eq("id", profile_id)
             .limit(1)
             .execute()
@@ -5870,7 +5915,7 @@ def search_users():
 
         res = (
             supabase.table("profiles")
-            .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at")
+            .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at,banner_config")
             .limit(100)
             .execute()
         )
@@ -5936,7 +5981,7 @@ def read_profile_by_username(username):
     try:
         res = (
             supabase.table("profiles")
-            .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at,created_at,plan_tier")
+            .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at,banner_config,created_at,plan_tier")
             .eq("username", username)
             .limit(1)
             .execute()
@@ -6064,7 +6109,7 @@ def read_profile(profile_id):
     try:
         res = (
             supabase.table("profiles")
-            .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at,created_at,plan_tier")
+            .select("id,username,display_name,bio,avatar_url,account_privacy,avatar_config,avatar_version,avatar_updated_at,banner_config,created_at,plan_tier")
             .eq("id", profile_id)
             .limit(1)
             .execute()
