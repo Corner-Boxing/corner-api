@@ -152,6 +152,77 @@ LEARN_INFINITE_DAILY_POINT_CAP = 12
 
 LEARN_HEARTBEAT_MAX_SECONDS = 120
 
+
+TRAIN_MODES = {
+    "power",
+    "defense",
+    "footwork",
+    "speed",
+    "endurance",
+    "focus",
+    "infinite",
+    "reaction",
+    "opponent",
+}
+
+
+TRAIN_MODE_STAT_CYCLES = {
+    "power": (
+        "power",
+    ),
+
+    "defense": (
+        "defense",
+    ),
+
+    "footwork": (
+        "footwork",
+    ),
+
+    "speed": (
+        "speed",
+    ),
+
+    "endurance": (
+        "endurance",
+    ),
+
+    "focus": (
+        "focus",
+    ),
+
+    "infinite": (
+        "power",
+        "speed",
+        "defense",
+        "footwork",
+        "endurance",
+        "focus",
+    ),
+
+    "reaction": (
+        "speed",
+        "focus",
+    ),
+
+    "opponent": (
+        "defense",
+        "focus",
+        "speed",
+    ),
+}
+
+
+TRAIN_BLOCK_SECONDS = (
+    5 * 60
+)
+
+
+TRAIN_DAILY_POINT_CAP = 12
+
+
+TRAIN_HEARTBEAT_MAX_SECONDS = 120
+
 def is_developer_user(user_id: str | None):
     return bool(
         user_id
@@ -2278,6 +2349,10 @@ def learn_session_start():
             uid
         )
 
+        train_abandon_active_sessions(
+            uid
+        )
+
         audio_duration_seconds = 0
         required_seconds = 0
 
@@ -3273,6 +3348,1175 @@ def learn_session_abandon(
                 str(e),
         }), 500
 
+# -------------------------------------------------
+# Train
+# -------------------------------------------------
+
+def train_session_row(
+    session_id: str,
+):
+    if not session_id:
+        return None
+
+    res = (
+        supabase
+        .table("train_sessions")
+        .select("*")
+        .eq(
+            "id",
+            session_id,
+        )
+        .limit(1)
+        .execute()
+    )
+
+    return (
+        res.data[0]
+        if res.data
+        else None
+    )
+
+
+def train_abandon_active_sessions(
+    user_id: str,
+):
+    if not user_id:
+        return
+
+    now = utc_now_iso()
+
+    try:
+        (
+            supabase
+            .table("train_sessions")
+            .update({
+                "status":
+                    "abandoned",
+
+                "ended_at":
+                    now,
+
+                "updated_at":
+                    now,
+            })
+            .eq(
+                "user_id",
+                user_id,
+            )
+            .eq(
+                "status",
+                "active",
+            )
+            .execute()
+        )
+
+    except Exception:
+        pass
+
+
+def train_apply_heartbeat(
+    session_row: dict,
+    data: dict,
+):
+    if not session_row:
+        return (
+            session_row,
+            0,
+        )
+
+    if (
+        str(
+            session_row.get(
+                "status"
+            )
+            or ""
+        ).lower()
+        != "active"
+    ):
+        return (
+            session_row,
+            0,
+        )
+
+    now_dt = datetime.now(
+        timezone.utc
+    )
+
+    now_iso = (
+        now_dt.isoformat()
+    )
+
+    last_dt = (
+        parse_utc_datetime(
+            session_row.get(
+                "last_heartbeat_at"
+            )
+        )
+        or parse_utc_datetime(
+            session_row.get(
+                "started_at"
+            )
+        )
+        or now_dt
+    )
+
+    server_gap_seconds = max(
+        0,
+        int(
+            (
+                now_dt
+                - last_dt
+            )
+            .total_seconds()
+        ),
+    )
+
+    claimed_seconds = max(
+        0,
+        min(
+            TRAIN_HEARTBEAT_MAX_SECONDS,
+            safe_int(
+                data.get(
+                    "active_delta_seconds"
+                ),
+                0,
+            ),
+        ),
+    )
+
+    accepted_seconds = min(
+        claimed_seconds,
+        max(
+            0,
+            server_gap_seconds
+            + 2,
+        ),
+        TRAIN_HEARTBEAT_MAX_SECONDS,
+    )
+
+    old_verified = max(
+        0,
+        safe_int(
+            session_row.get(
+                "verified_active_seconds"
+            ),
+            0,
+        ),
+    )
+
+    new_verified = (
+        old_verified
+        + accepted_seconds
+    )
+
+    update_payload = {
+        "verified_active_seconds":
+            new_verified,
+
+        "last_heartbeat_at":
+            now_iso,
+
+        "updated_at":
+            now_iso,
+    }
+
+    (
+        supabase
+        .table("train_sessions")
+        .update(
+            update_payload
+        )
+        .eq(
+            "id",
+            session_row.get(
+                "id"
+            ),
+        )
+        .execute()
+    )
+
+    return (
+        {
+            **session_row,
+            **update_payload,
+        },
+        accepted_seconds,
+    )
+
+
+def train_daily_points(
+    user_id: str,
+):
+    if not user_id:
+        return 0
+
+    day_start = (
+        datetime.now(
+            timezone.utc
+        )
+        .replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+    )
+
+    try:
+        res = (
+            supabase
+            .table("train_sessions")
+            .select(
+                "stat_total_points"
+            )
+            .eq(
+                "user_id",
+                user_id,
+            )
+            .eq(
+                "status",
+                "completed",
+            )
+            .gte(
+                "completed_at",
+                day_start.isoformat(),
+            )
+            .execute()
+        )
+
+        total = sum(
+            max(
+                0,
+                safe_int(
+                    row.get(
+                        "stat_total_points"
+                    ),
+                    0,
+                ),
+            )
+            for row
+            in (
+                res.data
+                or []
+            )
+        )
+
+        return min(
+            TRAIN_DAILY_POINT_CAP,
+            total,
+        )
+
+    except Exception:
+        return 0
+
+
+def train_mode_total_points(
+    user_id: str,
+    mode: str,
+):
+    if (
+        not user_id
+        or mode not in TRAIN_MODES
+    ):
+        return 0
+
+    try:
+        res = (
+            supabase
+            .table("train_sessions")
+            .select(
+                "stat_total_points"
+            )
+            .eq(
+                "user_id",
+                user_id,
+            )
+            .eq(
+                "mode",
+                mode,
+            )
+            .eq(
+                "status",
+                "completed",
+            )
+            .execute()
+        )
+
+        return sum(
+            max(
+                0,
+                safe_int(
+                    row.get(
+                        "stat_total_points"
+                    ),
+                    0,
+                ),
+            )
+            for row
+            in (
+                res.data
+                or []
+            )
+        )
+
+    except Exception:
+        return 0
+
+
+def train_stat_awards(
+    mode: str,
+    point_count: int,
+    cycle_offset: int = 0,
+):
+    cycle = (
+        TRAIN_MODE_STAT_CYCLES.get(
+            mode
+        )
+        or ()
+    )
+
+    if not cycle:
+        return {}
+
+    point_count = max(
+        0,
+        safe_int(
+            point_count,
+            0,
+        ),
+    )
+
+    cycle_offset = max(
+        0,
+        safe_int(
+            cycle_offset,
+            0,
+        ),
+    )
+
+    awards = {
+        "power": 0,
+        "speed": 0,
+        "defense": 0,
+        "footwork": 0,
+        "endurance": 0,
+        "focus": 0,
+    }
+
+    for index in range(
+        point_count
+    ):
+        key = cycle[
+            (
+                cycle_offset
+                + index
+            )
+            % len(
+                cycle
+            )
+        ]
+
+        awards[key] += 1
+
+    return {
+        key: value
+        for key, value
+        in awards.items()
+        if value > 0
+    }
+
+
+def train_status_payload(
+    user_id: str,
+):
+    mode_seconds = {
+        mode: 0
+        for mode
+        in TRAIN_MODES
+    }
+
+    total_seconds = 0
+
+    try:
+        res = (
+            supabase
+            .table("train_sessions")
+            .select(
+                "mode,"
+                "verified_active_seconds,"
+                "status"
+            )
+            .eq(
+                "user_id",
+                user_id,
+            )
+            .eq(
+                "status",
+                "completed",
+            )
+            .execute()
+        )
+
+        for row in (
+            res.data
+            or []
+        ):
+            mode = str(
+                row.get(
+                    "mode"
+                )
+                or ""
+            ).strip().lower()
+
+            if mode not in TRAIN_MODES:
+                continue
+
+            verified = max(
+                0,
+                safe_int(
+                    row.get(
+                        "verified_active_seconds"
+                    ),
+                    0,
+                ),
+            )
+
+            mode_seconds[mode] += (
+                verified
+            )
+
+            total_seconds += (
+                verified
+            )
+
+    except Exception:
+        pass
+
+    return {
+        "daily_points":
+            train_daily_points(
+                user_id
+            ),
+
+        "daily_point_cap":
+            TRAIN_DAILY_POINT_CAP,
+
+        "total_seconds":
+            total_seconds,
+
+        "mode_seconds":
+            mode_seconds,
+
+        "stats":
+            calculate_user_stats(
+                user_id
+            ),
+    }
+
+
+@app.route(
+    "/train/status",
+    methods=["GET"],
+)
+def train_status():
+    uid, err = require_user_id()
+
+    if err:
+        return err
+
+    try:
+        return jsonify({
+            "status":
+                "ok",
+
+            **train_status_payload(
+                uid
+            ),
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status":
+                "error",
+
+            "error":
+                "Could not load Train progress.",
+
+            "details":
+                str(e),
+        }), 500
+
+
+@app.route(
+    "/train/session/start",
+    methods=["POST"],
+)
+def train_session_start():
+    uid, err = require_user_id()
+
+    if err:
+        return err
+
+    data = (
+        request.get_json(
+            force=True,
+            silent=True,
+        )
+        or {}
+    )
+
+    mode = str(
+        data.get(
+            "mode"
+        )
+        or ""
+    ).strip().lower()
+
+    if mode not in TRAIN_MODES:
+        return jsonify({
+            "status":
+                "error",
+
+            "error":
+                "Invalid Train mode.",
+        }), 400
+
+    try:
+        train_abandon_active_sessions(
+            uid
+        )
+
+        learn_abandon_active_sessions(
+            uid
+        )
+
+        now = utc_now_iso()
+
+        payload = {
+            "user_id":
+                uid,
+
+            "mode":
+                mode,
+
+            "status":
+                "active",
+
+            "verified_active_seconds":
+                0,
+
+            "stat_awards":
+                {},
+
+            "stat_total_points":
+                0,
+
+            "started_at":
+                now,
+
+            "last_heartbeat_at":
+                now,
+
+            "created_at":
+                now,
+
+            "updated_at":
+                now,
+        }
+
+        res = (
+            supabase
+            .table("train_sessions")
+            .insert(
+                payload
+            )
+            .execute()
+        )
+
+        if not res.data:
+            return jsonify({
+                "status":
+                    "error",
+
+                "error":
+                    "Train session creation returned no row.",
+            }), 500
+
+        return jsonify({
+            "status":
+                "ok",
+
+            "session":
+                res.data[0],
+
+            "train_status":
+                train_status_payload(
+                    uid
+                ),
+        }), 201
+
+    except Exception as e:
+        return jsonify({
+            "status":
+                "error",
+
+            "error":
+                "Could not start Train session.",
+
+            "details":
+                str(e),
+        }), 500
+
+
+@app.route(
+    "/train/session/<session_id>/heartbeat",
+    methods=["POST"],
+)
+def train_session_heartbeat(
+    session_id,
+):
+    uid, err = require_user_id()
+
+    if err:
+        return err
+
+    data = (
+        request.get_json(
+            force=True,
+            silent=True,
+        )
+        or {}
+    )
+
+    try:
+        row = train_session_row(
+            str(
+                session_id
+                or ""
+            )
+        )
+
+        if not row:
+            return jsonify({
+                "status":
+                    "error",
+
+                "error":
+                    "Train session not found.",
+            }), 404
+
+        if (
+            str(
+                row.get(
+                    "user_id"
+                )
+                or ""
+            )
+            != uid
+        ):
+            return jsonify({
+                "status":
+                    "error",
+
+                "error":
+                    "Forbidden.",
+            }), 403
+
+        if (
+            str(
+                row.get(
+                    "status"
+                )
+                or ""
+            ).lower()
+            != "active"
+        ):
+            return jsonify({
+                "status":
+                    "ok",
+
+                "active":
+                    False,
+
+                "verified_active_seconds":
+                    max(
+                        0,
+                        safe_int(
+                            row.get(
+                                "verified_active_seconds"
+                            ),
+                            0,
+                        ),
+                    ),
+            }), 200
+
+        updated, accepted = (
+            train_apply_heartbeat(
+                row,
+                data,
+            )
+        )
+
+        return jsonify({
+            "status":
+                "ok",
+
+            "active":
+                True,
+
+            "accepted_delta_seconds":
+                accepted,
+
+            "verified_active_seconds":
+                max(
+                    0,
+                    safe_int(
+                        updated.get(
+                            "verified_active_seconds"
+                        ),
+                        0,
+                    ),
+                ),
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status":
+                "error",
+
+            "error":
+                "Could not verify Train activity.",
+
+            "details":
+                str(e),
+        }), 500
+
+
+@app.route(
+    "/train/session/<session_id>/finish",
+    methods=["POST"],
+)
+def train_session_finish(
+    session_id,
+):
+    uid, err = require_user_id()
+
+    if err:
+        return err
+
+    data = (
+        request.get_json(
+            force=True,
+            silent=True,
+        )
+        or {}
+    )
+
+    try:
+        row = train_session_row(
+            str(
+                session_id
+                or ""
+            )
+        )
+
+        if not row:
+            return jsonify({
+                "status":
+                    "error",
+
+                "error":
+                    "Train session not found.",
+            }), 404
+
+        if (
+            str(
+                row.get(
+                    "user_id"
+                )
+                or ""
+            )
+            != uid
+        ):
+            return jsonify({
+                "status":
+                    "error",
+
+                "error":
+                    "Forbidden.",
+            }), 403
+
+        existing_status = str(
+            row.get(
+                "status"
+            )
+            or ""
+        ).lower()
+
+        if existing_status == "completed":
+            return jsonify({
+                "status":
+                    "ok",
+
+                "completed":
+                    True,
+
+                "already_completed":
+                    True,
+
+                "mode":
+                    row.get(
+                        "mode"
+                    ),
+
+                "verified_active_seconds":
+                    max(
+                        0,
+                        safe_int(
+                            row.get(
+                                "verified_active_seconds"
+                            ),
+                            0,
+                        ),
+                    ),
+
+                "stat_awards":
+                    safe_json_value(
+                        row.get(
+                            "stat_awards"
+                        ),
+                        {},
+                    ),
+
+                "stat_total_points":
+                    max(
+                        0,
+                        safe_int(
+                            row.get(
+                                "stat_total_points"
+                            ),
+                            0,
+                        ),
+                    ),
+
+                "train_status":
+                    train_status_payload(
+                        uid
+                    ),
+            }), 200
+
+        if existing_status != "active":
+            return jsonify({
+                "status":
+                    "error",
+
+                "error":
+                    "This Train session is no longer active.",
+            }), 409
+
+        row, accepted = (
+            train_apply_heartbeat(
+                row,
+                data,
+            )
+        )
+
+        verified_seconds = max(
+            0,
+            safe_int(
+                row.get(
+                    "verified_active_seconds"
+                ),
+                0,
+            ),
+        )
+
+        mode = str(
+            row.get(
+                "mode"
+            )
+            or ""
+        ).strip().lower()
+
+        if mode not in TRAIN_MODES:
+            return jsonify({
+                "status":
+                    "error",
+
+                "error":
+                    "Train session has an invalid mode.",
+            }), 400
+
+        completed_blocks = (
+            verified_seconds
+            // TRAIN_BLOCK_SECONDS
+        )
+
+        daily_points_before = (
+            train_daily_points(
+                uid
+            )
+        )
+
+        daily_remaining = max(
+            0,
+            TRAIN_DAILY_POINT_CAP
+            - daily_points_before,
+        )
+
+        awarded_point_count = min(
+            completed_blocks,
+            daily_remaining,
+        )
+
+        cycle_offset = (
+            train_mode_total_points(
+                uid,
+                mode,
+            )
+        )
+
+        awards = (
+            train_stat_awards(
+                mode,
+                awarded_point_count,
+                cycle_offset,
+            )
+        )
+
+        stat_total_points = sum(
+            max(
+                0,
+                safe_int(
+                    value,
+                    0,
+                ),
+            )
+            for value
+            in awards.values()
+        )
+
+        stats_before = (
+            calculate_user_stats(
+                uid
+            )
+        )
+
+        if stat_total_points > 0:
+            sync_progress_badge_unlocks(
+                uid,
+                stats_before,
+                notify_new=False,
+            )
+
+        now = utc_now_iso()
+
+        (
+            supabase
+            .table("train_sessions")
+            .update({
+                "status":
+                    "completed",
+
+                "completed_at":
+                    now,
+
+                "ended_at":
+                    now,
+
+                "stat_awards":
+                    awards,
+
+                "stat_total_points":
+                    stat_total_points,
+
+                "updated_at":
+                    now,
+            })
+            .eq(
+                "id",
+                row.get(
+                    "id"
+                ),
+            )
+            .execute()
+        )
+
+        stats_after = (
+            calculate_user_stats(
+                uid
+            )
+        )
+
+        badge_unlocks = []
+
+        if stat_total_points > 0:
+            badge_unlocks = (
+                sync_progress_badge_unlocks(
+                    uid,
+                    stats_after,
+                    notify_new=True,
+                )
+            )
+
+        return jsonify({
+            "status":
+                "ok",
+
+            "completed":
+                True,
+
+            "mode":
+                mode,
+
+            "verified_active_seconds":
+                verified_seconds,
+
+            "completed_five_minute_blocks":
+                completed_blocks,
+
+            "stat_awards":
+                awards,
+
+            "stat_total_points":
+                stat_total_points,
+
+            "daily_points_before":
+                daily_points_before,
+
+            "daily_points_after":
+                min(
+                    TRAIN_DAILY_POINT_CAP,
+                    daily_points_before
+                    + stat_total_points,
+                ),
+
+            "daily_point_cap":
+                TRAIN_DAILY_POINT_CAP,
+
+            "badge_unlocks":
+                badge_unlocks,
+
+            "stats":
+                stats_after,
+
+            "train_status":
+                train_status_payload(
+                    uid
+                ),
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status":
+                "error",
+
+            "error":
+                "Could not finish Train session.",
+
+            "details":
+                str(e),
+        }), 500
+
+
+@app.route(
+    "/train/session/<session_id>/abandon",
+    methods=["POST"],
+)
+def train_session_abandon(
+    session_id,
+):
+    uid, err = require_user_id()
+
+    if err:
+        return err
+
+    try:
+        row = train_session_row(
+            str(
+                session_id
+                or ""
+            )
+        )
+
+        if not row:
+            return jsonify({
+                "status":
+                    "error",
+
+                "error":
+                    "Train session not found.",
+            }), 404
+
+        if (
+            str(
+                row.get(
+                    "user_id"
+                )
+                or ""
+            )
+            != uid
+        ):
+            return jsonify({
+                "status":
+                    "error",
+
+                "error":
+                    "Forbidden.",
+            }), 403
+
+        if (
+            str(
+                row.get(
+                    "status"
+                )
+                or ""
+            ).lower()
+            == "active"
+        ):
+            now = utc_now_iso()
+
+            (
+                supabase
+                .table("train_sessions")
+                .update({
+                    "status":
+                        "abandoned",
+
+                    "ended_at":
+                        now,
+
+                    "updated_at":
+                        now,
+                })
+                .eq(
+                    "id",
+                    row.get(
+                        "id"
+                    ),
+                )
+                .execute()
+            )
+
+        return jsonify({
+            "status":
+                "ok",
+
+            "abandoned":
+                True,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status":
+                "error",
+
+            "error":
+                "Could not end Train session.",
+
+            "details":
+                str(e),
+        }), 500
 
 def normalize_promo_code(value):
     return re.sub(
@@ -4540,6 +5784,8 @@ def calculate_user_stats(user_id: str | None):
     learn_infinite_seconds = 0
     learn_lessons_completed = 0
 
+    train_total_seconds = 0
+
     round_type_counts = {}
 
     # -----------------------------------------
@@ -4807,14 +6053,87 @@ def calculate_user_stats(user_id: str | None):
     except Exception:
         pass
 
+    # -----------------------------------------
+    # Verified Train sessions
+    # -----------------------------------------
+
+    try:
+        train_res = (
+            supabase
+            .table("train_sessions")
+            .select(
+                "mode,"
+                "verified_active_seconds,"
+                "stat_awards,"
+                "stat_total_points,"
+                "status,"
+                "completed_at"
+            )
+            .eq(
+                "user_id",
+                user_id,
+            )
+            .eq(
+                "status",
+                "completed",
+            )
+            .order(
+                "completed_at",
+                desc=True,
+            )
+            .limit(1000)
+            .execute()
+        )
+
+        for row in (
+            train_res.data
+            or []
+        ):
+            train_total_seconds += max(
+                0,
+                safe_int(
+                    row.get(
+                        "verified_active_seconds"
+                    ),
+                    0,
+                ),
+            )
+
+            awards = safe_json_value(
+                row.get(
+                    "stat_awards"
+                ),
+                {},
+            )
+
+            for key in STAT_KEYS:
+                points[key] += max(
+                    0,
+                    safe_int(
+                        awards.get(
+                            key
+                        ),
+                        0,
+                    ),
+                )
+
+    except Exception:
+        pass
+
     learn_minutes = (
         learn_total_seconds
+        // 60
+    )
+
+    train_minutes = (
+        train_total_seconds
         // 60
     )
 
     total_minutes = (
         class_minutes
         + learn_minutes
+        + train_minutes
     )
 
     summary = build_stats_summary(
@@ -4846,6 +6165,10 @@ def calculate_user_stats(user_id: str | None):
         learn_infinite_seconds
         // 60
     )
+
+    summary[
+        "train_minutes"
+    ] = train_minutes
 
     return summary
 
