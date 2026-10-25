@@ -113,6 +113,45 @@ DEFAULT_GYM_BADGE_CONFIG = {
     "icon_color": "#f6f6f6",
 }
 
+LEARN_LESSON_AWARDS = {
+    1: {
+        "power": 1,
+        "speed": 1,
+        "focus": 2,
+    },
+
+    2: {
+        "speed": 1,
+        "defense": 2,
+        "focus": 1,
+    },
+
+    3: {
+        "speed": 1,
+        "defense": 1,
+        "footwork": 2,
+    },
+}
+
+
+LEARN_INFINITE_STAT_CYCLE = (
+    "focus",
+    "speed",
+    "defense",
+    "footwork",
+)
+
+
+LEARN_INFINITE_BLOCK_SECONDS = (
+    5 * 60
+)
+
+
+LEARN_INFINITE_DAILY_POINT_CAP = 12
+
+
+LEARN_HEARTBEAT_MAX_SECONDS = 120
+
 def is_developer_user(user_id: str | None):
     return bool(
         user_id
@@ -1489,6 +1528,1752 @@ def require_developer_user_id():
     return uid, None
 
 
+# -------------------------------------------------
+# Learn
+# -------------------------------------------------
+
+def learn_completion_rows(
+    user_id: str,
+):
+    if not user_id:
+        return []
+
+    res = (
+        supabase
+        .table("learn_completions")
+        .select(
+            "user_id,"
+            "step,"
+            "first_session_id,"
+            "stat_awards,"
+            "completed_at"
+        )
+        .eq(
+            "user_id",
+            user_id,
+        )
+        .order(
+            "step"
+        )
+        .execute()
+    )
+
+    return res.data or []
+
+
+def learn_completed_steps(
+    user_id: str,
+):
+    return {
+        max(
+            1,
+            min(
+                3,
+                safe_int(
+                    row.get("step"),
+                    0,
+                ),
+            ),
+        )
+        for row
+        in learn_completion_rows(
+            user_id
+        )
+        if safe_int(
+            row.get("step"),
+            0,
+        ) in (
+            1,
+            2,
+            3,
+        )
+    }
+
+
+def learn_step_is_unlocked(
+    step: int,
+    completed_steps: set | None = None,
+):
+    completed_steps = (
+        completed_steps
+        or set()
+    )
+
+    if step == 1:
+        return True
+
+    if step == 2:
+        return 1 in completed_steps
+
+    if step == 3:
+        return 2 in completed_steps
+
+    if step == 4:
+        return 3 in completed_steps
+
+    return False
+
+
+def learn_daily_infinite_points(
+    user_id: str,
+):
+    if not user_id:
+        return 0
+
+    day_start = (
+        datetime.now(
+            timezone.utc
+        )
+        .replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+    )
+
+    try:
+        res = (
+            supabase
+            .table("learn_sessions")
+            .select(
+                "stat_total_points"
+            )
+            .eq(
+                "user_id",
+                user_id,
+            )
+            .eq(
+                "step",
+                4,
+            )
+            .eq(
+                "status",
+                "completed",
+            )
+            .gte(
+                "completed_at",
+                day_start.isoformat(),
+            )
+            .execute()
+        )
+
+        total = 0
+
+        for row in (
+            res.data
+            or []
+        ):
+            total += max(
+                0,
+                safe_int(
+                    row.get(
+                        "stat_total_points"
+                    ),
+                    0,
+                ),
+            )
+
+        return min(
+            LEARN_INFINITE_DAILY_POINT_CAP,
+            total,
+        )
+
+    except Exception:
+        return 0
+
+
+def learn_total_infinite_seconds(
+    user_id: str,
+):
+    if not user_id:
+        return 0
+
+    try:
+        res = (
+            supabase
+            .table("learn_sessions")
+            .select(
+                "verified_active_seconds"
+            )
+            .eq(
+                "user_id",
+                user_id,
+            )
+            .eq(
+                "step",
+                4,
+            )
+            .eq(
+                "status",
+                "completed",
+            )
+            .execute()
+        )
+
+        return sum(
+            max(
+                0,
+                safe_int(
+                    row.get(
+                        "verified_active_seconds"
+                    ),
+                    0,
+                ),
+            )
+            for row
+            in (
+                res.data
+                or []
+            )
+        )
+
+    except Exception:
+        return 0
+
+
+def learn_status_payload(
+    user_id: str,
+):
+    rows = learn_completion_rows(
+        user_id
+    )
+
+    completed_steps = sorted({
+        safe_int(
+            row.get("step"),
+            0,
+        )
+        for row
+        in rows
+        if safe_int(
+            row.get("step"),
+            0,
+        ) in (
+            1,
+            2,
+            3,
+        )
+    })
+
+    completed_set = set(
+        completed_steps
+    )
+
+    completion_map = {}
+
+    for row in rows:
+        step = safe_int(
+            row.get("step"),
+            0,
+        )
+
+        if step not in (
+            1,
+            2,
+            3,
+        ):
+            continue
+
+        completion_map[
+            str(step)
+        ] = {
+            "completed_at":
+                row.get(
+                    "completed_at"
+                ),
+
+            "stat_awards":
+                safe_json_value(
+                    row.get(
+                        "stat_awards"
+                    ),
+                    {},
+                ),
+        }
+
+    unlocked_steps = [
+        step
+        for step
+        in (
+            1,
+            2,
+            3,
+            4,
+        )
+        if learn_step_is_unlocked(
+            step,
+            completed_set,
+        )
+    ]
+
+    return {
+        "completed_steps":
+            completed_steps,
+
+        "completion_map":
+            completion_map,
+
+        "unlocked_steps":
+            unlocked_steps,
+
+        "fundamentals_complete":
+            len(
+                completed_steps
+            ) >= 3,
+
+        "infinite_today_points":
+            learn_daily_infinite_points(
+                user_id
+            ),
+
+        "infinite_daily_cap":
+            LEARN_INFINITE_DAILY_POINT_CAP,
+
+        "infinite_total_seconds":
+            learn_total_infinite_seconds(
+                user_id
+            ),
+
+        "stats":
+            calculate_user_stats(
+                user_id
+            ),
+    }
+
+
+def learn_session_row(
+    session_id: str,
+):
+    if not session_id:
+        return None
+
+    res = (
+        supabase
+        .table("learn_sessions")
+        .select("*")
+        .eq(
+            "id",
+            session_id,
+        )
+        .limit(1)
+        .execute()
+    )
+
+    return (
+        res.data[0]
+        if res.data
+        else None
+    )
+
+
+def learn_abandon_active_sessions(
+    user_id: str,
+):
+    if not user_id:
+        return
+
+    now = utc_now_iso()
+
+    try:
+        (
+            supabase
+            .table("learn_sessions")
+            .update({
+                "status":
+                    "abandoned",
+
+                "ended_at":
+                    now,
+
+                "updated_at":
+                    now,
+            })
+            .eq(
+                "user_id",
+                user_id,
+            )
+            .eq(
+                "status",
+                "active",
+            )
+            .execute()
+        )
+
+    except Exception:
+        pass
+
+
+def learn_apply_heartbeat(
+    session_row: dict,
+    data: dict,
+):
+    if not session_row:
+        return (
+            session_row,
+            0,
+        )
+
+    if (
+        str(
+            session_row.get(
+                "status"
+            )
+            or ""
+        ).lower()
+        != "active"
+    ):
+        return (
+            session_row,
+            0,
+        )
+
+    now_dt = datetime.now(
+        timezone.utc
+    )
+
+    now_iso = (
+        now_dt.isoformat()
+    )
+
+    last_dt = (
+        parse_utc_datetime(
+            session_row.get(
+                "last_heartbeat_at"
+            )
+        )
+        or parse_utc_datetime(
+            session_row.get(
+                "started_at"
+            )
+        )
+        or now_dt
+    )
+
+    server_gap_seconds = max(
+        0,
+        int(
+            (
+                now_dt
+                - last_dt
+            )
+            .total_seconds()
+        ),
+    )
+
+    claimed_seconds = max(
+        0,
+        min(
+            LEARN_HEARTBEAT_MAX_SECONDS,
+            safe_int(
+                data.get(
+                    "active_delta_seconds"
+                ),
+                0,
+            ),
+        ),
+    )
+
+    accepted_seconds = min(
+        claimed_seconds,
+        max(
+            0,
+            server_gap_seconds
+            + 2,
+        ),
+        LEARN_HEARTBEAT_MAX_SECONDS,
+    )
+
+    old_verified = max(
+        0,
+        safe_int(
+            session_row.get(
+                "verified_active_seconds"
+            ),
+            0,
+        ),
+    )
+
+    new_verified = (
+        old_verified
+        + accepted_seconds
+    )
+
+    update_payload = {
+        "verified_active_seconds":
+            new_verified,
+
+        "last_heartbeat_at":
+            now_iso,
+
+        "updated_at":
+            now_iso,
+    }
+
+    step = safe_int(
+        session_row.get(
+            "step"
+        ),
+        0,
+    )
+
+    if step in (
+        1,
+        2,
+        3,
+    ):
+        duration = max(
+            0,
+            safe_int(
+                session_row.get(
+                    "audio_duration_seconds"
+                ),
+                0,
+            ),
+        )
+
+        reported_duration = max(
+            0,
+            safe_int(
+                data.get(
+                    "audio_duration_seconds"
+                ),
+                0,
+            ),
+        )
+
+        if (
+            duration <= 0
+            and reported_duration > 0
+        ):
+            duration = min(
+                7200,
+                reported_duration,
+            )
+
+            update_payload[
+                "audio_duration_seconds"
+            ] = duration
+
+        old_position = max(
+            0,
+            safe_int(
+                session_row.get(
+                    "audio_position_seconds"
+                ),
+                0,
+            ),
+        )
+
+        reported_position = max(
+            0,
+            safe_int(
+                data.get(
+                    "audio_position_seconds"
+                ),
+                0,
+            ),
+        )
+
+        max_forward_position = (
+            old_position
+            + accepted_seconds
+            + 8
+        )
+
+        if duration > 0:
+            new_position = min(
+                duration,
+                reported_position,
+                max_forward_position,
+            )
+        else:
+            new_position = min(
+                reported_position,
+                max_forward_position,
+            )
+
+        new_position = max(
+            old_position,
+            new_position,
+        )
+
+        update_payload[
+            "audio_position_seconds"
+        ] = new_position
+
+    (
+        supabase
+        .table("learn_sessions")
+        .update(
+            update_payload
+        )
+        .eq(
+            "id",
+            session_row.get(
+                "id"
+            ),
+        )
+        .execute()
+    )
+
+    return (
+        {
+            **session_row,
+            **update_payload,
+        },
+        accepted_seconds,
+    )
+
+
+def learn_infinite_stat_awards(
+    point_count: int,
+    cycle_offset: int = 0,
+):
+    point_count = max(
+        0,
+        safe_int(
+            point_count,
+            0,
+        ),
+    )
+
+    cycle_offset = max(
+        0,
+        safe_int(
+            cycle_offset,
+            0,
+        ),
+    )
+
+    awards = {
+        "power": 0,
+        "speed": 0,
+        "defense": 0,
+        "footwork": 0,
+        "endurance": 0,
+        "focus": 0,
+    }
+
+    for index in range(
+        point_count
+    ):
+        key = (
+            LEARN_INFINITE_STAT_CYCLE[
+                (
+                    cycle_offset
+                    + index
+                )
+                % len(
+                    LEARN_INFINITE_STAT_CYCLE
+                )
+            ]
+        )
+
+        awards[key] += 1
+
+    return {
+        key: value
+        for key, value
+        in awards.items()
+        if value > 0
+    }
+
+
+@app.route(
+    "/learn/status",
+    methods=["GET"],
+)
+def learn_status():
+    uid, err = require_user_id()
+
+    if err:
+        return err
+
+    try:
+        return jsonify({
+            "status":
+                "ok",
+
+            **learn_status_payload(
+                uid
+            ),
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status":
+                "error",
+
+            "error":
+                "Could not load Learn progress.",
+
+            "details":
+                str(e),
+        }), 500
+
+
+@app.route(
+    "/learn/session/start",
+    methods=["POST"],
+)
+def learn_session_start():
+    uid, err = require_user_id()
+
+    if err:
+        return err
+
+    data = (
+        request.get_json(
+            force=True,
+            silent=True,
+        )
+        or {}
+    )
+
+    step = safe_int(
+        data.get(
+            "step"
+        ),
+        0,
+    )
+
+    if step not in (
+        1,
+        2,
+        3,
+        4,
+    ):
+        return jsonify({
+            "status":
+                "error",
+
+            "error":
+                "Invalid Learn step.",
+        }), 400
+
+    try:
+        completed_steps = (
+            learn_completed_steps(
+                uid
+            )
+        )
+
+        if not learn_step_is_unlocked(
+            step,
+            completed_steps,
+        ):
+            return jsonify({
+                "status":
+                    "locked",
+
+                "error":
+                    "Complete the previous Learn step first.",
+            }), 403
+
+        # A user can only actively verify one Learn
+        # session at a time. Starting again cleanly
+        # abandons a stale/interrupted session.
+        learn_abandon_active_sessions(
+            uid
+        )
+
+        audio_duration_seconds = 0
+        required_seconds = 0
+
+        if step in (
+            1,
+            2,
+            3,
+        ):
+            audio_duration_seconds = max(
+                0,
+                min(
+                    7200,
+                    safe_int(
+                        data.get(
+                            "audio_duration_seconds"
+                        ),
+                        0,
+                    ),
+                ),
+            )
+
+            if (
+                audio_duration_seconds
+                < 60
+            ):
+                return jsonify({
+                    "status":
+                        "error",
+
+                    "error":
+                        "Lesson audio metadata is not ready yet.",
+                }), 400
+
+            required_seconds = max(
+                60,
+                int(
+                    audio_duration_seconds
+                    * 0.85
+                ),
+            )
+
+        session_type = (
+            "infinite"
+            if step == 4
+            else "lesson"
+        )
+
+        now = utc_now_iso()
+
+        payload = {
+            "user_id":
+                uid,
+
+            "step":
+                step,
+
+            "session_type":
+                session_type,
+
+            "status":
+                "active",
+
+            "audio_duration_seconds":
+                audio_duration_seconds,
+
+            "required_seconds":
+                required_seconds,
+
+            "audio_position_seconds":
+                0,
+
+            "verified_active_seconds":
+                0,
+
+            "stat_awards":
+                {},
+
+            "stat_total_points":
+                0,
+
+            "started_at":
+                now,
+
+            "last_heartbeat_at":
+                now,
+
+            "created_at":
+                now,
+
+            "updated_at":
+                now,
+        }
+
+        res = (
+            supabase
+            .table("learn_sessions")
+            .insert(
+                payload
+            )
+            .execute()
+        )
+
+        if not res.data:
+            return jsonify({
+                "status":
+                    "error",
+
+                "error":
+                    "Learn session creation returned no row.",
+            }), 500
+
+        return jsonify({
+            "status":
+                "ok",
+
+            "session":
+                res.data[0],
+
+            "learn_status":
+                learn_status_payload(
+                    uid
+                ),
+        }), 201
+
+    except Exception as e:
+        return jsonify({
+            "status":
+                "error",
+
+            "error":
+                "Could not start Learn session.",
+
+            "details":
+                str(e),
+        }), 500
+
+
+@app.route(
+    "/learn/session/<session_id>/heartbeat",
+    methods=["POST"],
+)
+def learn_session_heartbeat(
+    session_id,
+):
+    uid, err = require_user_id()
+
+    if err:
+        return err
+
+    data = (
+        request.get_json(
+            force=True,
+            silent=True,
+        )
+        or {}
+    )
+
+    try:
+        row = learn_session_row(
+            str(
+                session_id
+                or ""
+            )
+        )
+
+        if not row:
+            return jsonify({
+                "status":
+                    "error",
+
+                "error":
+                    "Learn session not found.",
+            }), 404
+
+        if (
+            str(
+                row.get(
+                    "user_id"
+                )
+                or ""
+            )
+            != uid
+        ):
+            return jsonify({
+                "status":
+                    "error",
+
+                "error":
+                    "Forbidden.",
+            }), 403
+
+        if (
+            str(
+                row.get(
+                    "status"
+                )
+                or ""
+            ).lower()
+            != "active"
+        ):
+            return jsonify({
+                "status":
+                    "ok",
+
+                "active":
+                    False,
+
+                "verified_active_seconds":
+                    max(
+                        0,
+                        safe_int(
+                            row.get(
+                                "verified_active_seconds"
+                            ),
+                            0,
+                        ),
+                    ),
+
+                "audio_position_seconds":
+                    max(
+                        0,
+                        safe_int(
+                            row.get(
+                                "audio_position_seconds"
+                            ),
+                            0,
+                        ),
+                    ),
+            }), 200
+
+        updated, accepted = (
+            learn_apply_heartbeat(
+                row,
+                data,
+            )
+        )
+
+        return jsonify({
+            "status":
+                "ok",
+
+            "active":
+                True,
+
+            "accepted_delta_seconds":
+                accepted,
+
+            "verified_active_seconds":
+                max(
+                    0,
+                    safe_int(
+                        updated.get(
+                            "verified_active_seconds"
+                        ),
+                        0,
+                    ),
+                ),
+
+            "required_seconds":
+                max(
+                    0,
+                    safe_int(
+                        updated.get(
+                            "required_seconds"
+                        ),
+                        0,
+                    ),
+                ),
+
+            "audio_position_seconds":
+                max(
+                    0,
+                    safe_int(
+                        updated.get(
+                            "audio_position_seconds"
+                        ),
+                        0,
+                    ),
+                ),
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status":
+                "error",
+
+            "error":
+                "Could not verify Learn activity.",
+
+            "details":
+                str(e),
+        }), 500
+
+
+@app.route(
+    "/learn/session/<session_id>/finish",
+    methods=["POST"],
+)
+def learn_session_finish(
+    session_id,
+):
+    uid, err = require_user_id()
+
+    if err:
+        return err
+
+    data = (
+        request.get_json(
+            force=True,
+            silent=True,
+        )
+        or {}
+    )
+
+    try:
+        row = learn_session_row(
+            str(
+                session_id
+                or ""
+            )
+        )
+
+        if not row:
+            return jsonify({
+                "status":
+                    "error",
+
+                "error":
+                    "Learn session not found.",
+            }), 404
+
+        if (
+            str(
+                row.get(
+                    "user_id"
+                )
+                or ""
+            )
+            != uid
+        ):
+            return jsonify({
+                "status":
+                    "error",
+
+                "error":
+                    "Forbidden.",
+            }), 403
+
+        existing_status = str(
+            row.get(
+                "status"
+            )
+            or ""
+        ).lower()
+
+        if existing_status == "completed":
+            return jsonify({
+                "status":
+                    "ok",
+
+                "completed":
+                    True,
+
+                "already_completed":
+                    True,
+
+                "verified_active_seconds":
+                    max(
+                        0,
+                        safe_int(
+                            row.get(
+                                "verified_active_seconds"
+                            ),
+                            0,
+                        ),
+                    ),
+
+                "stat_awards":
+                    safe_json_value(
+                        row.get(
+                            "stat_awards"
+                        ),
+                        {},
+                    ),
+
+                "learn_status":
+                    learn_status_payload(
+                        uid
+                    ),
+            }), 200
+
+        if existing_status != "active":
+            return jsonify({
+                "status":
+                    "error",
+
+                "error":
+                    "This Learn session is no longer active.",
+            }), 409
+
+        row, accepted = (
+            learn_apply_heartbeat(
+                row,
+                data,
+            )
+        )
+
+        step = safe_int(
+            row.get(
+                "step"
+            ),
+            0,
+        )
+
+        now = utc_now_iso()
+
+        if step in (
+            1,
+            2,
+            3,
+        ):
+            verified_seconds = max(
+                0,
+                safe_int(
+                    row.get(
+                        "verified_active_seconds"
+                    ),
+                    0,
+                ),
+            )
+
+            required_seconds = max(
+                60,
+                safe_int(
+                    row.get(
+                        "required_seconds"
+                    ),
+                    60,
+                ),
+            )
+
+            duration_seconds = max(
+                0,
+                safe_int(
+                    row.get(
+                        "audio_duration_seconds"
+                    ),
+                    0,
+                ),
+            )
+
+            position_seconds = max(
+                0,
+                safe_int(
+                    row.get(
+                        "audio_position_seconds"
+                    ),
+                    0,
+                ),
+            )
+
+            audio_ended = bool(
+                data.get(
+                    "audio_ended"
+                )
+            )
+
+            end_tolerance = max(
+                5,
+                int(
+                    duration_seconds
+                    * 0.01
+                ),
+            )
+
+            required_position = max(
+                0,
+                duration_seconds
+                - end_tolerance,
+            )
+
+            if (
+                not audio_ended
+                or verified_seconds
+                    < required_seconds
+                or position_seconds
+                    < required_position
+            ):
+                return jsonify({
+                    "status":
+                        "not_verified",
+
+                    "completed":
+                        False,
+
+                    "error":
+                        "The lesson did not meet verified completion requirements.",
+
+                    "verified_active_seconds":
+                        verified_seconds,
+
+                    "required_seconds":
+                        required_seconds,
+
+                    "audio_position_seconds":
+                        position_seconds,
+
+                    "required_position_seconds":
+                        required_position,
+                }), 409
+
+            stats_before = (
+                calculate_user_stats(
+                    uid
+                )
+            )
+
+            sync_progress_badge_unlocks(
+                uid,
+                stats_before,
+                notify_new=False,
+            )
+
+            existing_completion = (
+                supabase
+                .table("learn_completions")
+                .select(
+                    "user_id,"
+                    "step,"
+                    "first_session_id,"
+                    "stat_awards,"
+                    "completed_at"
+                )
+                .eq(
+                    "user_id",
+                    uid,
+                )
+                .eq(
+                    "step",
+                    step,
+                )
+                .limit(1)
+                .execute()
+            )
+
+            first_completion = (
+                not bool(
+                    existing_completion.data
+                )
+            )
+
+            awards = {}
+
+            if first_completion:
+                awards = dict(
+                    LEARN_LESSON_AWARDS.get(
+                        step,
+                        {},
+                    )
+                )
+
+                try:
+                    completion_res = (
+                        supabase
+                        .table("learn_completions")
+                        .insert({
+                            "user_id":
+                                uid,
+
+                            "step":
+                                step,
+
+                            "first_session_id":
+                                row.get(
+                                    "id"
+                                ),
+
+                            "stat_awards":
+                                awards,
+
+                            "completed_at":
+                                now,
+                        })
+                        .execute()
+                    )
+
+                    if not completion_res.data:
+                        first_completion = False
+                        awards = {}
+
+                except Exception:
+                    # A duplicate race means another request
+                    # already recorded this completion.
+                    verify_completion = (
+                        supabase
+                        .table("learn_completions")
+                        .select("user_id")
+                        .eq(
+                            "user_id",
+                            uid,
+                        )
+                        .eq(
+                            "step",
+                            step,
+                        )
+                        .limit(1)
+                        .execute()
+                    )
+
+                    if verify_completion.data:
+                        first_completion = False
+                        awards = {}
+                    else:
+                        raise
+
+            stat_total_points = sum(
+                max(
+                    0,
+                    safe_int(
+                        value,
+                        0,
+                    ),
+                )
+                for value
+                in awards.values()
+            )
+
+            (
+                supabase
+                .table("learn_sessions")
+                .update({
+                    "status":
+                        "completed",
+
+                    "completed_at":
+                        now,
+
+                    "ended_at":
+                        now,
+
+                    "stat_awards":
+                        awards,
+
+                    "stat_total_points":
+                        stat_total_points,
+
+                    "updated_at":
+                        now,
+                })
+                .eq(
+                    "id",
+                    row.get(
+                        "id"
+                    ),
+                )
+                .execute()
+            )
+
+            badge_unlocks = []
+
+            if first_completion:
+                stats_after = (
+                    calculate_user_stats(
+                        uid
+                    )
+                )
+
+                badge_unlocks = (
+                    sync_progress_badge_unlocks(
+                        uid,
+                        stats_after,
+                        notify_new=True,
+                    )
+                )
+            else:
+                stats_after = (
+                    calculate_user_stats(
+                        uid
+                    )
+                )
+
+            return jsonify({
+                "status":
+                    "ok",
+
+                "completed":
+                    True,
+
+                "first_completion":
+                    first_completion,
+
+                "step":
+                    step,
+
+                "verified_active_seconds":
+                    verified_seconds,
+
+                "stat_awards":
+                    awards,
+
+                "stat_total_points":
+                    stat_total_points,
+
+                "badge_unlocks":
+                    badge_unlocks,
+
+                "stats":
+                    stats_after,
+
+                "learn_status":
+                    learn_status_payload(
+                        uid
+                    ),
+            }), 200
+
+        if step == 4:
+            verified_seconds = max(
+                0,
+                safe_int(
+                    row.get(
+                        "verified_active_seconds"
+                    ),
+                    0,
+                ),
+            )
+
+            completed_blocks = (
+                verified_seconds
+                // LEARN_INFINITE_BLOCK_SECONDS
+            )
+
+            daily_points_before = (
+                learn_daily_infinite_points(
+                    uid
+                )
+            )
+
+            daily_remaining = max(
+                0,
+                LEARN_INFINITE_DAILY_POINT_CAP
+                - daily_points_before,
+            )
+
+            awarded_point_count = min(
+                completed_blocks,
+                daily_remaining,
+            )
+
+            awards = (
+                learn_infinite_stat_awards(
+                    awarded_point_count,
+                    daily_points_before,
+                )
+            )
+
+            stat_total_points = sum(
+                max(
+                    0,
+                    safe_int(
+                        value,
+                        0,
+                    ),
+                )
+                for value
+                in awards.values()
+            )
+
+            stats_before = (
+                calculate_user_stats(
+                    uid
+                )
+            )
+
+            if stat_total_points > 0:
+                sync_progress_badge_unlocks(
+                    uid,
+                    stats_before,
+                    notify_new=False,
+                )
+
+            (
+                supabase
+                .table("learn_sessions")
+                .update({
+                    "status":
+                        "completed",
+
+                    "completed_at":
+                        now,
+
+                    "ended_at":
+                        now,
+
+                    "stat_awards":
+                        awards,
+
+                    "stat_total_points":
+                        stat_total_points,
+
+                    "updated_at":
+                        now,
+                })
+                .eq(
+                    "id",
+                    row.get(
+                        "id"
+                    ),
+                )
+                .execute()
+            )
+
+            stats_after = (
+                calculate_user_stats(
+                    uid
+                )
+            )
+
+            badge_unlocks = []
+
+            if stat_total_points > 0:
+                badge_unlocks = (
+                    sync_progress_badge_unlocks(
+                        uid,
+                        stats_after,
+                        notify_new=True,
+                    )
+                )
+
+            return jsonify({
+                "status":
+                    "ok",
+
+                "completed":
+                    True,
+
+                "step":
+                    4,
+
+                "verified_active_seconds":
+                    verified_seconds,
+
+                "completed_five_minute_blocks":
+                    completed_blocks,
+
+                "stat_awards":
+                    awards,
+
+                "stat_total_points":
+                    stat_total_points,
+
+                "daily_points_before":
+                    daily_points_before,
+
+                "daily_points_after":
+                    min(
+                        LEARN_INFINITE_DAILY_POINT_CAP,
+                        daily_points_before
+                        + stat_total_points,
+                    ),
+
+                "daily_point_cap":
+                    LEARN_INFINITE_DAILY_POINT_CAP,
+
+                "badge_unlocks":
+                    badge_unlocks,
+
+                "stats":
+                    stats_after,
+
+                "learn_status":
+                    learn_status_payload(
+                        uid
+                    ),
+            }), 200
+
+        return jsonify({
+            "status":
+                "error",
+
+            "error":
+                "Invalid Learn session step.",
+        }), 400
+
+    except Exception as e:
+        return jsonify({
+            "status":
+                "error",
+
+            "error":
+                "Could not finish Learn session.",
+
+            "details":
+                str(e),
+        }), 500
+
+
+@app.route(
+    "/learn/session/<session_id>/abandon",
+    methods=["POST"],
+)
+def learn_session_abandon(
+    session_id,
+):
+    uid, err = require_user_id()
+
+    if err:
+        return err
+
+    try:
+        row = learn_session_row(
+            str(
+                session_id
+                or ""
+            )
+        )
+
+        if not row:
+            return jsonify({
+                "status":
+                    "error",
+
+                "error":
+                    "Learn session not found.",
+            }), 404
+
+        if (
+            str(
+                row.get(
+                    "user_id"
+                )
+                or ""
+            )
+            != uid
+        ):
+            return jsonify({
+                "status":
+                    "error",
+
+                "error":
+                    "Forbidden.",
+            }), 403
+
+        if (
+            str(
+                row.get(
+                    "status"
+                )
+                or ""
+            ).lower()
+            == "active"
+        ):
+            now = utc_now_iso()
+
+            (
+                supabase
+                .table("learn_sessions")
+                .update({
+                    "status":
+                        "abandoned",
+
+                    "ended_at":
+                        now,
+
+                    "updated_at":
+                        now,
+                })
+                .eq(
+                    "id",
+                    row.get(
+                        "id"
+                    ),
+                )
+                .execute()
+            )
+
+        return jsonify({
+            "status":
+                "ok",
+
+            "abandoned":
+                True,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status":
+                "error",
+
+            "error":
+                "Could not end Learn session.",
+
+            "details":
+                str(e),
+        }), 500
+
+
 def normalize_promo_code(value):
     return re.sub(
         r"\s+",
@@ -2745,51 +4530,324 @@ def calculate_user_stats(user_id: str | None):
     if not user_id:
         return empty_user_stats()
 
+    points = empty_stat_points()
+
+    class_minutes = 0
+    total_rounds = 0
+    completed_classes = 0
+
+    learn_total_seconds = 0
+    learn_infinite_seconds = 0
+    learn_lessons_completed = 0
+
+    round_type_counts = {}
+
+    # -----------------------------------------
+    # Verified generated classes
+    # -----------------------------------------
+
     try:
-        res = (
-            supabase.table("class_sessions")
-            .select("id,length_min,round_count,stat_total_points,stat_awards,round_breakdown,status,listened_complete,completed_at")
-            .eq("user_id", user_id)
-            .eq("status", "done")
-            .eq("listened_complete", True)
-            .order("completed_at", desc=True)
+        class_res = (
+            supabase
+            .table("class_sessions")
+            .select(
+                "id,"
+                "length_min,"
+                "round_count,"
+                "stat_total_points,"
+                "stat_awards,"
+                "round_breakdown,"
+                "status,"
+                "listened_complete,"
+                "completed_at"
+            )
+            .eq(
+                "user_id",
+                user_id,
+            )
+            .eq(
+                "status",
+                "done",
+            )
+            .eq(
+                "listened_complete",
+                True,
+            )
+            .order(
+                "completed_at",
+                desc=True,
+            )
             .limit(300)
             .execute()
         )
 
-        rows = res.data or []
-        points = empty_stat_points()
-        total_minutes = 0
-        total_rounds = 0
-        completed_classes = 0
-
-        round_type_counts = {}
-
-        for row in rows:
+        for row in (
+            class_res.data
+            or []
+        ):
             completed_classes += 1
-            total_minutes += max(0, safe_int(row.get("length_min"), 0))
 
-            awards = safe_json_value(row.get("stat_awards"), {})
+            class_minutes += max(
+                0,
+                safe_int(
+                    row.get(
+                        "length_min"
+                    ),
+                    0,
+                ),
+            )
+
+            awards = safe_json_value(
+                row.get(
+                    "stat_awards"
+                ),
+                {},
+            )
+
             for key in STAT_KEYS:
-                points[key] += max(0, safe_int((awards or {}).get(key), 0))
+                points[key] += max(
+                    0,
+                    safe_int(
+                        awards.get(
+                            key
+                        ),
+                        0,
+                    ),
+                )
 
-            breakdown = safe_json_value(row.get("round_breakdown"), [])
-            if isinstance(breakdown, list):
-                total_rounds += len(breakdown)
-                for r in breakdown:
-                    if isinstance(r, dict):
-                        rt = str(r.get("type") or "").strip()
-                        if rt:
-                            round_type_counts[rt] = round_type_counts.get(rt, 0) + 1
+            breakdown = safe_json_value(
+                row.get(
+                    "round_breakdown"
+                ),
+                [],
+            )
+
+            if isinstance(
+                breakdown,
+                list,
+            ):
+                total_rounds += len(
+                    breakdown
+                )
+
+                for round_row in breakdown:
+                    if not isinstance(
+                        round_row,
+                        dict,
+                    ):
+                        continue
+
+                    round_type = str(
+                        round_row.get(
+                            "type"
+                        )
+                        or ""
+                    ).strip()
+
+                    if round_type:
+                        round_type_counts[
+                            round_type
+                        ] = (
+                            round_type_counts.get(
+                                round_type,
+                                0,
+                            )
+                            + 1
+                        )
+
             else:
-                total_rounds += max(0, safe_int(row.get("round_count"), 0))
-
-        summary = build_stats_summary(points, completed_classes, total_minutes, total_rounds)
-        summary["round_type_counts"] = round_type_counts
-        return summary
+                total_rounds += max(
+                    0,
+                    safe_int(
+                        row.get(
+                            "round_count"
+                        ),
+                        0,
+                    ),
+                )
 
     except Exception:
-        return empty_user_stats()
+        pass
+
+    # -----------------------------------------
+    # One-time Learn lesson awards
+    # -----------------------------------------
+
+    try:
+        completion_res = (
+            supabase
+            .table("learn_completions")
+            .select(
+                "step,"
+                "stat_awards,"
+                "completed_at"
+            )
+            .eq(
+                "user_id",
+                user_id,
+            )
+            .execute()
+        )
+
+        completion_rows = (
+            completion_res.data
+            or []
+        )
+
+        learn_lessons_completed = len(
+            completion_rows
+        )
+
+        for row in completion_rows:
+            awards = safe_json_value(
+                row.get(
+                    "stat_awards"
+                ),
+                {},
+            )
+
+            for key in STAT_KEYS:
+                points[key] += max(
+                    0,
+                    safe_int(
+                        awards.get(
+                            key
+                        ),
+                        0,
+                    ),
+                )
+
+    except Exception:
+        learn_lessons_completed = 0
+
+    # -----------------------------------------
+    # Learn verified time + Infinite awards
+    # -----------------------------------------
+
+    try:
+        learn_res = (
+            supabase
+            .table("learn_sessions")
+            .select(
+                "step,"
+                "session_type,"
+                "verified_active_seconds,"
+                "stat_awards,"
+                "stat_total_points,"
+                "status,"
+                "completed_at"
+            )
+            .eq(
+                "user_id",
+                user_id,
+            )
+            .eq(
+                "status",
+                "completed",
+            )
+            .order(
+                "completed_at",
+                desc=True,
+            )
+            .limit(1000)
+            .execute()
+        )
+
+        for row in (
+            learn_res.data
+            or []
+        ):
+            verified_seconds = max(
+                0,
+                safe_int(
+                    row.get(
+                        "verified_active_seconds"
+                    ),
+                    0,
+                ),
+            )
+
+            learn_total_seconds += (
+                verified_seconds
+            )
+
+            if (
+                safe_int(
+                    row.get(
+                        "step"
+                    ),
+                    0,
+                )
+                != 4
+            ):
+                continue
+
+            learn_infinite_seconds += (
+                verified_seconds
+            )
+
+            awards = safe_json_value(
+                row.get(
+                    "stat_awards"
+                ),
+                {},
+            )
+
+            for key in STAT_KEYS:
+                points[key] += max(
+                    0,
+                    safe_int(
+                        awards.get(
+                            key
+                        ),
+                        0,
+                    ),
+                )
+
+    except Exception:
+        pass
+
+    learn_minutes = (
+        learn_total_seconds
+        // 60
+    )
+
+    total_minutes = (
+        class_minutes
+        + learn_minutes
+    )
+
+    summary = build_stats_summary(
+        points,
+        completed_classes,
+        total_minutes,
+        total_rounds,
+    )
+
+    summary[
+        "round_type_counts"
+    ] = round_type_counts
+
+    summary[
+        "class_minutes"
+    ] = class_minutes
+
+    summary[
+        "learn_minutes"
+    ] = learn_minutes
+
+    summary[
+        "learn_lessons_completed"
+    ] = learn_lessons_completed
+
+    summary[
+        "learn_infinite_minutes"
+    ] = (
+        learn_infinite_seconds
+        // 60
+    )
+
+    return summary
 
 def badge_ids_from_stats(stats: dict | None):
     stats = stats or empty_user_stats()
