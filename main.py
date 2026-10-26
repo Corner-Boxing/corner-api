@@ -1242,8 +1242,6 @@ def me():
             ),
     }), 200
 
-    }), 200
-
 
 @app.route(
     "/tutorial/status",
