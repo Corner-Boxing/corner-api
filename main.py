@@ -223,6 +223,14 @@ TRAIN_DAILY_POINT_CAP = 12
 
 TRAIN_HEARTBEAT_MAX_SECONDS = 120
 
+
+CURRENT_TUTORIAL_VERSION = 1
+
+TUTORIAL_FINAL_STATUSES = {
+    "completed",
+    "skipped",
+}
+
 def is_developer_user(user_id: str | None):
     return bool(
         user_id
@@ -1233,6 +1241,227 @@ def me():
                 row
             ),
     }), 200
+
+    }), 200
+
+
+@app.route(
+    "/tutorial/status",
+    methods=["GET"],
+)
+def tutorial_status():
+    uid, err = require_user_id()
+
+    if err:
+        return err
+
+    try:
+        ensure_profile_row(uid)
+
+        res = (
+            supabase
+            .table("profiles")
+            .select(
+                "tutorial_version,"
+                "tutorial_status,"
+                "tutorial_completed_at,"
+                "tutorial_updated_at"
+            )
+            .eq("id", uid)
+            .limit(1)
+            .execute()
+        )
+
+        row = (
+            res.data[0]
+            if res.data
+            else {}
+        )
+
+        stored_version = max(
+            0,
+            safe_int(
+                row.get(
+                    "tutorial_version"
+                ),
+                0,
+            ),
+        )
+
+        stored_status = str(
+            row.get(
+                "tutorial_status"
+            )
+            or "not_started"
+        ).strip().lower()
+
+        current_version_seen = (
+            stored_version
+            >= CURRENT_TUTORIAL_VERSION
+            and stored_status
+            in TUTORIAL_FINAL_STATUSES
+        )
+
+        return jsonify({
+            "status":
+                "ok",
+
+            "current_version":
+                CURRENT_TUTORIAL_VERSION,
+
+            "tutorial_version":
+                stored_version,
+
+            "tutorial_status":
+                stored_status,
+
+            "tutorial_completed_at":
+                row.get(
+                    "tutorial_completed_at"
+                ),
+
+            "tutorial_updated_at":
+                row.get(
+                    "tutorial_updated_at"
+                ),
+
+            "should_auto_start":
+                not current_version_seen,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status":
+                "error",
+
+            "error":
+                "Could not load tutorial status.",
+
+            "details":
+                str(e),
+        }), 500
+
+
+@app.route(
+    "/tutorial/mark",
+    methods=["POST"],
+)
+def tutorial_mark():
+    uid, err = require_user_id()
+
+    if err:
+        return err
+
+    data = (
+        request.get_json(
+            force=True,
+            silent=True,
+        )
+        or {}
+    )
+
+    action = str(
+        data.get("status")
+        or ""
+    ).strip().lower()
+
+    if action not in TUTORIAL_FINAL_STATUSES:
+        return jsonify({
+            "status":
+                "error",
+
+            "error":
+                "Tutorial status must be completed or skipped.",
+        }), 400
+
+    try:
+        ensure_profile_row(uid)
+
+        now = utc_now_iso()
+
+        payload = {
+            "tutorial_version":
+                CURRENT_TUTORIAL_VERSION,
+
+            "tutorial_status":
+                action,
+
+            "tutorial_updated_at":
+                now,
+
+            "tutorial_completed_at":
+                now
+                if action == "completed"
+                else None,
+        }
+
+        res = (
+            supabase
+            .table("profiles")
+            .update(
+                payload
+            )
+            .eq(
+                "id",
+                uid,
+            )
+            .execute()
+        )
+
+        err_msg = supa_err(res)
+
+        if err_msg:
+            return jsonify({
+                "status":
+                    "error",
+
+                "error":
+                    "Could not save tutorial status.",
+
+                "details":
+                    err_msg,
+            }), 500
+
+        return jsonify({
+            "status":
+                "ok",
+
+            "current_version":
+                CURRENT_TUTORIAL_VERSION,
+
+            "tutorial_version":
+                CURRENT_TUTORIAL_VERSION,
+
+            "tutorial_status":
+                action,
+
+            "tutorial_completed_at":
+                payload[
+                    "tutorial_completed_at"
+                ],
+
+            "tutorial_updated_at":
+                now,
+
+            "should_auto_start":
+                False,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status":
+                "error",
+
+            "error":
+                "Could not save tutorial status.",
+
+            "details":
+                str(e),
+        }), 500
+
+
+@app.route("/me/profile", methods=["PATCH"])
+def update_my_profile():
 
 @app.route("/me/profile", methods=["PATCH"])
 def update_my_profile():
