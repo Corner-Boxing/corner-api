@@ -1457,10 +1457,6 @@ def tutorial_mark():
                 str(e),
         }), 500
 
-
-@app.route("/me/profile", methods=["PATCH"])
-def update_my_profile():
-
 @app.route("/me/profile", methods=["PATCH"])
 def update_my_profile():
     uid, err = require_user_id()
