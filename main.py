@@ -4,6 +4,7 @@ import base64
 import json
 import re
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client, Client
@@ -229,6 +230,31 @@ CURRENT_TUTORIAL_VERSION = 1
 TUTORIAL_FINAL_STATUSES = {
     "completed",
     "skipped",
+}
+
+STREAK_MIN_VERIFIED_SECONDS = 5 * 60
+STREAK_LOOKBACK_WEEKS = 104
+
+LEADERBOARD_PERIODS = {
+    "week",
+    "month",
+    "year",
+}
+
+LEADERBOARD_TOP_COUNT = 20
+LEADERBOARD_AROUND_RADIUS = 2
+
+COACH_REMINDER_COOLDOWN_DAYS = 4
+COACH_STREAK_WARNING_WEEKDAY = 5
+COACH_INACTIVE_DAYS = 5
+COACH_FIRST_SESSION_AFTER_DAYS = 3
+
+COACH_STREAK_MILESTONES = {
+    4,
+    8,
+    12,
+    26,
+    52,
 }
 
 def is_developer_user(user_id: str | None):
@@ -5933,6 +5959,1212 @@ STAT_LABELS = {
     "focus": "Focus",
 }
 
+def safe_corner_timezone(
+    value: str | None,
+):
+    name = str(
+        value
+        or ""
+    ).strip()
+
+    if (
+        not name
+        or len(name) > 80
+        or not re.fullmatch(
+            r"[A-Za-z0-9_+\-/]+",
+            name,
+        )
+    ):
+        return timezone.utc
+
+    try:
+        return ZoneInfo(
+            name
+        )
+
+    except Exception:
+        return timezone.utc
+
+
+def fetch_paged_rows(
+    build_query,
+    page_size: int = 1000,
+    max_pages: int = 20,
+):
+    rows = []
+
+    for page_index in range(
+        max_pages
+    ):
+        start = (
+            page_index
+            * page_size
+        )
+
+        end = (
+            start
+            + page_size
+            - 1
+        )
+
+        res = (
+            build_query()
+            .range(
+                start,
+                end,
+            )
+            .execute()
+        )
+
+        batch = (
+            res.data
+            or []
+        )
+
+        rows.extend(
+            batch
+        )
+
+        if (
+            len(batch)
+            < page_size
+        ):
+            break
+
+    return rows
+
+
+def verified_training_events(
+    user_id: str | None,
+):
+    if not user_id:
+        return []
+
+    now = datetime.now(
+        timezone.utc
+    )
+
+    cutoff = (
+        now
+        - timedelta(
+            weeks=(
+                STREAK_LOOKBACK_WEEKS
+                + 2
+            )
+        )
+    )
+
+    events = []
+
+    def add_event(
+        source,
+        raw_at,
+        seconds,
+    ):
+        event_at = (
+            parse_utc_datetime(
+                raw_at
+            )
+        )
+
+        if (
+            not event_at
+            or event_at < cutoff
+        ):
+            return
+
+        events.append({
+            "source":
+                source,
+
+            "at":
+                event_at,
+
+            "seconds":
+                max(
+                    0,
+                    safe_int(
+                        seconds,
+                        0,
+                    ),
+                ),
+        })
+
+    # -----------------------------------------
+    # Generated classes
+    # -----------------------------------------
+
+    try:
+        rows = fetch_paged_rows(
+            lambda: (
+                supabase
+                .table(
+                    "class_sessions"
+                )
+                .select(
+                    "id,"
+                    "length_min,"
+                    "completed_at,"
+                    "listened_complete_at"
+                )
+                .eq(
+                    "user_id",
+                    user_id,
+                )
+                .eq(
+                    "status",
+                    "done",
+                )
+                .eq(
+                    "listened_complete",
+                    True,
+                )
+            )
+        )
+
+        for row in rows:
+            seconds = max(
+                STREAK_MIN_VERIFIED_SECONDS,
+                safe_int(
+                    row.get(
+                        "length_min"
+                    ),
+                    0,
+                )
+                * 60,
+            )
+
+            add_event(
+                "class",
+                (
+                    row.get(
+                        "listened_complete_at"
+                    )
+                    or row.get(
+                        "completed_at"
+                    )
+                ),
+                seconds,
+            )
+
+    except Exception:
+        pass
+
+    # -----------------------------------------
+    # Learn
+    # -----------------------------------------
+
+    try:
+        rows = fetch_paged_rows(
+            lambda: (
+                supabase
+                .table(
+                    "learn_sessions"
+                )
+                .select(
+                    "id,"
+                    "verified_active_seconds,"
+                    "completed_at"
+                )
+                .eq(
+                    "user_id",
+                    user_id,
+                )
+                .eq(
+                    "status",
+                    "completed",
+                )
+            )
+        )
+
+        for row in rows:
+            seconds = max(
+                0,
+                safe_int(
+                    row.get(
+                        "verified_active_seconds"
+                    ),
+                    0,
+                ),
+            )
+
+            if (
+                seconds
+                < STREAK_MIN_VERIFIED_SECONDS
+            ):
+                continue
+
+            add_event(
+                "learn",
+                row.get(
+                    "completed_at"
+                ),
+                seconds,
+            )
+
+    except Exception:
+        pass
+
+    # -----------------------------------------
+    # Train
+    # -----------------------------------------
+
+    try:
+        rows = fetch_paged_rows(
+            lambda: (
+                supabase
+                .table(
+                    "train_sessions"
+                )
+                .select(
+                    "id,"
+                    "verified_active_seconds,"
+                    "completed_at"
+                )
+                .eq(
+                    "user_id",
+                    user_id,
+                )
+                .eq(
+                    "status",
+                    "completed",
+                )
+            )
+        )
+
+        for row in rows:
+            seconds = max(
+                0,
+                safe_int(
+                    row.get(
+                        "verified_active_seconds"
+                    ),
+                    0,
+                ),
+            )
+
+            if (
+                seconds
+                < STREAK_MIN_VERIFIED_SECONDS
+            ):
+                continue
+
+            add_event(
+                "train",
+                row.get(
+                    "completed_at"
+                ),
+                seconds,
+            )
+
+    except Exception:
+        pass
+
+    events.sort(
+        key=lambda event:
+            event["at"],
+        reverse=True,
+    )
+
+    return events
+
+
+def weekly_streak_payload(
+    user_id: str | None,
+    timezone_name: str | None = None,
+):
+    tz = safe_corner_timezone(
+        timezone_name
+    )
+
+    now_utc = datetime.now(
+        timezone.utc
+    )
+
+    local_now = (
+        now_utc
+        .astimezone(
+            tz
+        )
+    )
+
+    current_week_start = (
+        local_now
+        - timedelta(
+            days=local_now.weekday()
+        )
+    ).replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+    current_week_date = (
+        current_week_start
+        .date()
+    )
+
+    week_end_local = (
+        current_week_start
+        + timedelta(
+            days=7
+        )
+    )
+
+    events = (
+        verified_training_events(
+            user_id
+        )
+    )
+
+    week_map = {}
+
+    for event in events:
+        local_event = (
+            event["at"]
+            .astimezone(
+                tz
+            )
+        )
+
+        event_week_start = (
+            local_event
+            - timedelta(
+                days=local_event.weekday()
+            )
+        ).date()
+
+        if (
+            event_week_start
+            not in week_map
+        ):
+            week_map[
+                event_week_start
+            ] = {
+                "sessions":
+                    0,
+
+                "seconds":
+                    0,
+            }
+
+        week_map[
+            event_week_start
+        ][
+            "sessions"
+        ] += 1
+
+        week_map[
+            event_week_start
+        ][
+            "seconds"
+        ] += max(
+            0,
+            safe_int(
+                event.get(
+                    "seconds"
+                ),
+                0,
+            ),
+        )
+
+    trained_this_week = (
+        current_week_date
+        in week_map
+    )
+
+    if trained_this_week:
+        cursor = (
+            current_week_date
+        )
+
+    else:
+        cursor = (
+            current_week_date
+            - timedelta(
+                days=7
+            )
+        )
+
+    current_streak = 0
+
+    while (
+        cursor
+        in week_map
+    ):
+        current_streak += 1
+
+        cursor = (
+            cursor
+            - timedelta(
+                days=7
+            )
+        )
+
+    best_streak = 0
+    run = 0
+    previous_week = None
+
+    for week_date in sorted(
+        week_map.keys()
+    ):
+        if (
+            previous_week
+            and (
+                week_date
+                - previous_week
+            ).days
+            == 7
+        ):
+            run += 1
+
+        else:
+            run = 1
+
+        best_streak = max(
+            best_streak,
+            run,
+        )
+
+        previous_week = (
+            week_date
+        )
+
+    this_week = (
+        week_map.get(
+            current_week_date,
+            {
+                "sessions": 0,
+                "seconds": 0,
+            },
+        )
+    )
+
+    at_risk = bool(
+        current_streak > 0
+        and not trained_this_week
+    )
+
+    if trained_this_week:
+        status = "locked"
+
+    elif at_risk:
+        status = "at_risk"
+
+    else:
+        status = "open"
+
+    days_remaining = max(
+        0,
+        (
+            week_end_local.date()
+            - local_now.date()
+        ).days,
+    )
+
+    return {
+        "current_streak_weeks":
+            current_streak,
+
+        "best_streak_weeks":
+            best_streak,
+
+        "trained_this_week":
+            trained_this_week,
+
+        "at_risk":
+            at_risk,
+
+        "status":
+            status,
+
+        "week_sessions":
+            max(
+                0,
+                safe_int(
+                    this_week.get(
+                        "sessions"
+                    ),
+                    0,
+                ),
+            ),
+
+        "week_minutes":
+            max(
+                0,
+                safe_int(
+                    this_week.get(
+                        "seconds"
+                    ),
+                    0,
+                )
+                // 60,
+            ),
+
+        "days_remaining":
+            days_remaining,
+
+        "week_start":
+            current_week_date
+            .isoformat(),
+
+        "week_end":
+            week_end_local
+            .date()
+            .isoformat(),
+
+        "deadline_at":
+            week_end_local
+            .astimezone(
+                timezone.utc
+            )
+            .isoformat(),
+
+        "timezone":
+            getattr(
+                tz,
+                "key",
+                "UTC",
+            ),
+
+        "last_training_at":
+            (
+                events[0]["at"]
+                .isoformat()
+                if events
+                else None
+            ),
+
+        "qualifying_seconds":
+            STREAK_MIN_VERIFIED_SECONDS,
+    }
+
+
+def leaderboard_period_bounds(
+    period: str,
+):
+    clean_period = str(
+        period
+        or "week"
+    ).strip().lower()
+
+    if (
+        clean_period
+        not in LEADERBOARD_PERIODS
+    ):
+        clean_period = "week"
+
+    now = datetime.now(
+        timezone.utc
+    )
+
+    if clean_period == "week":
+        start = (
+            now
+            - timedelta(
+                days=now.weekday()
+            )
+        ).replace(
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+
+        end = (
+            start
+            + timedelta(
+                days=7
+            )
+        )
+
+    elif clean_period == "month":
+        start = now.replace(
+            day=1,
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+
+        if start.month == 12:
+            end = start.replace(
+                year=start.year + 1,
+                month=1,
+            )
+
+        else:
+            end = start.replace(
+                month=start.month + 1
+            )
+
+    else:
+        start = now.replace(
+            month=1,
+            day=1,
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+
+        end = start.replace(
+            year=start.year + 1
+        )
+
+    return (
+        clean_period,
+        start,
+        end,
+    )
+
+
+def load_leaderboard_profiles_map(
+    user_ids,
+):
+    clean_ids = [
+        str(user_id)
+        for user_id
+        in dict.fromkeys(
+            user_ids
+            or []
+        )
+        if user_id
+    ]
+
+    if not clean_ids:
+        return {}
+
+    output = {}
+
+    for offset in range(
+        0,
+        len(clean_ids),
+        100,
+    ):
+        chunk = (
+            clean_ids[
+                offset:
+                offset + 100
+            ]
+        )
+
+        try:
+            res = (
+                supabase
+                .table(
+                    "profiles"
+                )
+                .select(
+                    "id,"
+                    "username,"
+                    "display_name,"
+                    "bio,"
+                    "avatar_url,"
+                    "account_privacy,"
+                    "avatar_config,"
+                    "avatar_version,"
+                    "avatar_updated_at,"
+                    "banner_config"
+                )
+                .in_(
+                    "id",
+                    chunk,
+                )
+                .execute()
+            )
+
+            for row in (
+                res.data
+                or []
+            ):
+                profile_id = str(
+                    row.get(
+                        "id"
+                    )
+                    or ""
+                )
+
+                if not profile_id:
+                    continue
+
+                output[
+                    profile_id
+                ] = normalize_profile(
+                    row
+                )
+
+        except Exception:
+            continue
+
+    return output
+
+
+def build_leaderboard_payload(
+    viewer_id: str,
+    period: str,
+):
+    (
+        clean_period,
+        start,
+        end,
+    ) = leaderboard_period_bounds(
+        period
+    )
+
+    start_iso = (
+        start.isoformat()
+    )
+
+    end_iso = (
+        end.isoformat()
+    )
+
+    buckets = {}
+
+    def add_activity(
+        user_id,
+        seconds,
+        points=0,
+    ):
+        uid = str(
+            user_id
+            or ""
+        ).strip()
+
+        seconds = max(
+            0,
+            safe_int(
+                seconds,
+                0,
+            ),
+        )
+
+        if (
+            not uid
+            or seconds <= 0
+        ):
+            return
+
+        if uid not in buckets:
+            buckets[
+                uid
+            ] = {
+                "verified_seconds":
+                    0,
+
+                "sessions":
+                    0,
+
+                "period_points":
+                    0,
+            }
+
+        buckets[
+            uid
+        ][
+            "verified_seconds"
+        ] += seconds
+
+        buckets[
+            uid
+        ][
+            "sessions"
+        ] += 1
+
+        buckets[
+            uid
+        ][
+            "period_points"
+        ] += max(
+            0,
+            safe_int(
+                points,
+                0,
+            ),
+        )
+
+    # -----------------------------------------
+    # Generated classes
+    # -----------------------------------------
+
+    try:
+        rows = fetch_paged_rows(
+            lambda: (
+                supabase
+                .table(
+                    "class_sessions"
+                )
+                .select(
+                    "user_id,"
+                    "length_min,"
+                    "stat_total_points,"
+                    "listened_complete_at"
+                )
+                .eq(
+                    "status",
+                    "done",
+                )
+                .eq(
+                    "listened_complete",
+                    True,
+                )
+                .gte(
+                    "listened_complete_at",
+                    start_iso,
+                )
+                .lt(
+                    "listened_complete_at",
+                    end_iso,
+                )
+            )
+        )
+
+        for row in rows:
+            add_activity(
+                row.get(
+                    "user_id"
+                ),
+                max(
+                    STREAK_MIN_VERIFIED_SECONDS,
+                    safe_int(
+                        row.get(
+                            "length_min"
+                        ),
+                        0,
+                    )
+                    * 60,
+                ),
+                row.get(
+                    "stat_total_points"
+                ),
+            )
+
+    except Exception:
+        pass
+
+    # -----------------------------------------
+    # Learn
+    # -----------------------------------------
+
+    try:
+        rows = fetch_paged_rows(
+            lambda: (
+                supabase
+                .table(
+                    "learn_sessions"
+                )
+                .select(
+                    "user_id,"
+                    "verified_active_seconds,"
+                    "stat_total_points,"
+                    "completed_at"
+                )
+                .eq(
+                    "status",
+                    "completed",
+                )
+                .gte(
+                    "completed_at",
+                    start_iso,
+                )
+                .lt(
+                    "completed_at",
+                    end_iso,
+                )
+            )
+        )
+
+        for row in rows:
+            seconds = max(
+                0,
+                safe_int(
+                    row.get(
+                        "verified_active_seconds"
+                    ),
+                    0,
+                ),
+            )
+
+            if (
+                seconds
+                < STREAK_MIN_VERIFIED_SECONDS
+            ):
+                continue
+
+            add_activity(
+                row.get(
+                    "user_id"
+                ),
+                seconds,
+                row.get(
+                    "stat_total_points"
+                ),
+            )
+
+    except Exception:
+        pass
+
+    # -----------------------------------------
+    # Train
+    # -----------------------------------------
+
+    try:
+        rows = fetch_paged_rows(
+            lambda: (
+                supabase
+                .table(
+                    "train_sessions"
+                )
+                .select(
+                    "user_id,"
+                    "verified_active_seconds,"
+                    "stat_total_points,"
+                    "completed_at"
+                )
+                .eq(
+                    "status",
+                    "completed",
+                )
+                .gte(
+                    "completed_at",
+                    start_iso,
+                )
+                .lt(
+                    "completed_at",
+                    end_iso,
+                )
+            )
+        )
+
+        for row in rows:
+            seconds = max(
+                0,
+                safe_int(
+                    row.get(
+                        "verified_active_seconds"
+                    ),
+                    0,
+                ),
+            )
+
+            if (
+                seconds
+                < STREAK_MIN_VERIFIED_SECONDS
+            ):
+                continue
+
+            add_activity(
+                row.get(
+                    "user_id"
+                ),
+                seconds,
+                row.get(
+                    "stat_total_points"
+                ),
+            )
+
+    except Exception:
+        pass
+
+    profiles = (
+        load_leaderboard_profiles_map(
+            list(
+                buckets.keys()
+            )
+        )
+    )
+
+    ranked = []
+
+    for (
+        user_id,
+        activity,
+    ) in buckets.items():
+        profile = (
+            profiles.get(
+                user_id
+            )
+        )
+
+        if not profile:
+            continue
+
+        privacy = str(
+            profile.get(
+                "account_privacy"
+            )
+            or "public"
+        ).strip().lower()
+
+        if (
+            privacy == "private"
+            and user_id
+            != str(
+                viewer_id
+            )
+        ):
+            continue
+
+        ranked.append({
+            "user_id":
+                user_id,
+
+            "profile":
+                profile,
+
+            "verified_seconds":
+                max(
+                    0,
+                    safe_int(
+                        activity.get(
+                            "verified_seconds"
+                        ),
+                        0,
+                    ),
+                ),
+
+            "sessions":
+                max(
+                    0,
+                    safe_int(
+                        activity.get(
+                            "sessions"
+                        ),
+                        0,
+                    ),
+                ),
+
+            "period_points":
+                max(
+                    0,
+                    safe_int(
+                        activity.get(
+                            "period_points"
+                        ),
+                        0,
+                    ),
+                ),
+        })
+
+    ranked.sort(
+        key=lambda item: (
+            -item[
+                "verified_seconds"
+            ],
+
+            -item[
+                "sessions"
+            ],
+
+            -item[
+                "period_points"
+            ],
+
+            item[
+                "user_id"
+            ],
+        )
+    )
+
+    my_index = None
+
+    for index, item in enumerate(
+        ranked
+    ):
+        item[
+            "rank"
+        ] = index + 1
+
+        item[
+            "verified_minutes"
+        ] = (
+            item[
+                "verified_seconds"
+            ]
+            // 60
+        )
+
+        item[
+            "is_me"
+        ] = (
+            item[
+                "user_id"
+            ]
+            == str(
+                viewer_id
+            )
+        )
+
+        if item[
+            "is_me"
+        ]:
+            my_index = index
+
+    top_entries = (
+        ranked[
+            :LEADERBOARD_TOP_COUNT
+        ]
+    )
+
+    around_me = []
+
+    if (
+        my_index is not None
+        and my_index
+        >= LEADERBOARD_TOP_COUNT
+    ):
+        start_index = max(
+            0,
+            my_index
+            - LEADERBOARD_AROUND_RADIUS,
+        )
+
+        end_index = min(
+            len(ranked),
+            my_index
+            + LEADERBOARD_AROUND_RADIUS
+            + 1,
+        )
+
+        around_me = (
+            ranked[
+                start_index:
+                end_index
+            ]
+        )
+
+    return {
+        "period":
+            clean_period,
+
+        "period_start":
+            start_iso,
+
+        "period_end":
+            end_iso,
+
+        "metric":
+            "verified_training_time",
+
+        "total_ranked":
+            len(ranked),
+
+        "my_rank":
+            (
+                my_index + 1
+                if my_index
+                is not None
+                else None
+            ),
+
+        "entries":
+            top_entries,
+
+        "around_me":
+            around_me,
+    }
 
 def empty_stat_points():
     return {key: 0 for key in STAT_KEYS}
@@ -6972,6 +8204,92 @@ def listen_heartbeat(job_id):
             "details": str(e),
         }), 500
 
+@app.route(
+    "/progress/overview",
+    methods=["GET"],
+)
+def progress_overview():
+    uid, err = require_user_id()
+
+    if err:
+        return err
+
+    try:
+        timezone_name = (
+            request.args.get(
+                "tz"
+            )
+            or "UTC"
+        )
+
+        return jsonify({
+            "status":
+                "ok",
+
+            "streak":
+                weekly_streak_payload(
+                    uid,
+                    timezone_name,
+                ),
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status":
+                "error",
+
+            "error":
+                "Could not load training momentum.",
+
+            "details":
+                str(e),
+        }), 500
+
+
+@app.route(
+    "/leaderboard",
+    methods=["GET"],
+)
+def leaderboard():
+    uid, err = require_user_id()
+
+    if err:
+        return err
+
+    period = str(
+        request.args.get(
+            "period"
+        )
+        or "week"
+    ).strip().lower()
+
+    try:
+        payload = (
+            build_leaderboard_payload(
+                uid,
+                period,
+            )
+        )
+
+        return jsonify({
+            "status":
+                "ok",
+
+            **payload,
+        }), 200
+
+    except Exception as e:
+        return jsonify({
+            "status":
+                "error",
+
+            "error":
+                "Could not load the leaderboard.",
+
+            "details":
+                str(e),
+        }), 500
+
 @app.route("/home/feed", methods=["GET"])
 def home_feed():
     uid, err = require_user_id()
@@ -7098,6 +8416,21 @@ def home_notifications():
         return err
 
     try:
+        try:
+            maybe_create_coach_reminder(
+                uid,
+                request.args.get(
+                    "tz"
+                )
+                or "UTC",
+            )
+
+        except Exception as coach_err:
+            print(
+                "[coach-reminder] skipped after error:",
+                coach_err,
+            )
+
         res = (
             supabase.table("notifications")
             .select("*")
@@ -8348,6 +9681,383 @@ def create_notification(
         "error": last_error or "notification_insert_failed",
     }
 
+def coach_reminder_recent(
+    user_id: str,
+):
+    cutoff = (
+        datetime.now(
+            timezone.utc
+        )
+        - timedelta(
+            days=COACH_REMINDER_COOLDOWN_DAYS
+        )
+    )
+
+    try:
+        res = (
+            supabase
+            .table(
+                "coach_reminder_log"
+            )
+            .select(
+                "id"
+            )
+            .eq(
+                "user_id",
+                user_id,
+            )
+            .gte(
+                "created_at",
+                cutoff.isoformat(),
+            )
+            .limit(1)
+            .execute()
+        )
+
+        return bool(
+            res.data
+        )
+
+    except Exception:
+        return True
+
+
+def reserve_coach_reminder(
+    user_id: str,
+    reminder_type: str,
+    period_key: str,
+):
+    try:
+        res = (
+            supabase
+            .table(
+                "coach_reminder_log"
+            )
+            .insert({
+                "user_id":
+                    user_id,
+
+                "reminder_type":
+                    reminder_type,
+
+                "period_key":
+                    period_key,
+
+                "created_at":
+                    utc_now_iso(),
+            })
+            .execute()
+        )
+
+        return bool(
+            res.data
+        )
+
+    except Exception:
+        return False
+
+
+def maybe_create_coach_reminder(
+    user_id: str | None,
+    timezone_name: str | None = None,
+):
+    if not user_id:
+        return
+
+    if coach_reminder_recent(
+        user_id
+    ):
+        return
+
+    streak = (
+        weekly_streak_payload(
+            user_id,
+            timezone_name,
+        )
+    )
+
+    tz = safe_corner_timezone(
+        streak.get(
+            "timezone"
+        )
+        or timezone_name
+    )
+
+    now_utc = datetime.now(
+        timezone.utc
+    )
+
+    local_now = (
+        now_utc
+        .astimezone(
+            tz
+        )
+    )
+
+    last_training_at = (
+        parse_utc_datetime(
+            streak.get(
+                "last_training_at"
+            )
+        )
+    )
+
+    reminder = None
+
+    # -----------------------------------------
+    # 1. Protect an existing streak
+    # Saturday / Sunday only.
+    # -----------------------------------------
+
+    if (
+        streak.get(
+            "at_risk"
+        )
+        and safe_int(
+            streak.get(
+                "current_streak_weeks"
+            ),
+            0,
+        ) > 0
+        and local_now.weekday()
+        >= COACH_STREAK_WARNING_WEEKDAY
+    ):
+        weeks = safe_int(
+            streak.get(
+                "current_streak_weeks"
+            ),
+            0,
+        )
+
+        reminder = {
+            "type":
+                "coach_streak_risk",
+
+            "period_key":
+                str(
+                    streak.get(
+                        "week_start"
+                    )
+                    or ""
+                ),
+
+            "title":
+                "Coach · Protect the streak",
+
+            "body":
+                (
+                    f"You’re carrying a {weeks}-week streak. "
+                    "Get one verified workout in before Monday "
+                    "to keep it alive."
+                ),
+        }
+
+    # -----------------------------------------
+    # 2. No first verified workout yet
+    # -----------------------------------------
+
+    elif (
+        last_training_at
+        is None
+    ):
+        profile = (
+            ensure_profile_row(
+                user_id
+            )
+            or {}
+        )
+
+        created_at = (
+            parse_utc_datetime(
+                profile.get(
+                    "created_at"
+                )
+            )
+        )
+
+        if (
+            created_at
+            and (
+                now_utc
+                - created_at
+            )
+            >= timedelta(
+                days=COACH_FIRST_SESSION_AFTER_DAYS
+            )
+        ):
+            reminder = {
+                "type":
+                    "coach_first_session",
+
+                "period_key":
+                    "first-session",
+
+                "title":
+                    "Coach · Your corner is ready",
+
+                "body":
+                    (
+                        "You haven’t logged your first verified workout yet. "
+                        "Get five verified minutes in Learn or Train, "
+                        "or complete a class, and start building momentum."
+                    ),
+            }
+
+    # -----------------------------------------
+    # 3. Extended inactivity
+    # -----------------------------------------
+
+    elif (
+        now_utc
+        - last_training_at
+    ) >= timedelta(
+        days=COACH_INACTIVE_DAYS
+    ):
+        iso_year, iso_week, _ = (
+            local_now
+            .isocalendar()
+        )
+
+        inactive_days = max(
+            1,
+            int(
+                (
+                    now_utc
+                    - last_training_at
+                )
+                .total_seconds()
+                // 86400
+            ),
+        )
+
+        reminder = {
+            "type":
+                "coach_inactive",
+
+            "period_key":
+                (
+                    f"{iso_year}"
+                    f"-W{iso_week:02d}"
+                ),
+
+            "title":
+                "Coach · Time for another round",
+
+            "body":
+                (
+                    f"It’s been {inactive_days} days since your "
+                    "last verified workout. A short session is enough "
+                    "to get moving again."
+                ),
+        }
+
+    # -----------------------------------------
+    # 4. Major positive streak milestone
+    # -----------------------------------------
+
+    elif (
+        streak.get(
+            "trained_this_week"
+        )
+        and safe_int(
+            streak.get(
+                "current_streak_weeks"
+            ),
+            0,
+        )
+        in COACH_STREAK_MILESTONES
+    ):
+        weeks = safe_int(
+            streak.get(
+                "current_streak_weeks"
+            ),
+            0,
+        )
+
+        reminder = {
+            "type":
+                "coach_streak_milestone",
+
+            "period_key":
+                f"streak-{weeks}",
+
+            "title":
+                f"Coach · {weeks} weeks strong",
+
+            "body":
+                (
+                    f"You just locked in a {weeks}-week training streak. "
+                    "That consistency is becoming part of your game."
+                ),
+        }
+
+    if not reminder:
+        return
+
+    reserved = (
+        reserve_coach_reminder(
+            user_id,
+            reminder[
+                "type"
+            ],
+            reminder[
+                "period_key"
+            ],
+        )
+    )
+
+    if not reserved:
+        return
+
+    result = (
+        create_notification(
+            user_id,
+            None,
+            reminder[
+                "type"
+            ],
+            reminder[
+                "title"
+            ],
+            reminder[
+                "body"
+            ],
+            "coach",
+            None,
+        )
+    )
+
+    if not result.get(
+        "ok"
+    ):
+        try:
+            (
+                supabase
+                .table(
+                    "coach_reminder_log"
+                )
+                .delete()
+                .eq(
+                    "user_id",
+                    user_id,
+                )
+                .eq(
+                    "reminder_type",
+                    reminder[
+                        "type"
+                    ],
+                )
+                .eq(
+                    "period_key",
+                    reminder[
+                        "period_key"
+                    ],
+                )
+                .execute()
+            )
+
+        except Exception:
+            pass
 
 def notify_gym_members(
     gym_id: str,
