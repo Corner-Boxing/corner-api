@@ -9048,7 +9048,7 @@ def listen_heartbeat(job_id):
     job_id = str(job_id or "").strip()
     data = request.get_json(force=True, silent=True) or {}
 
-        timezone_name = str(
+    timezone_name = str(
         data.get(
             "timezone"
         )
