@@ -324,7 +324,99 @@ def profile_is_complete(profile: dict | None):
         return False
     return bool((profile.get("username") or "").strip() and (profile.get("display_name") or "").strip())
 
-AVATAR_VERSION = "avatar-v2"
+AVATAR_VERSION = "avatar-v3"
+
+AVATAR_LEGENDS = {
+    "redline": {
+        "name": "Redline",
+        "unlock_notice":
+            "Speed reached 100.",
+    },
+
+    "wildfire": {
+        "name": "Wildfire",
+        "unlock_notice":
+            "Power reached 100.",
+    },
+
+    "velvet": {
+        "name": "Velvet Knife",
+        "unlock_notice":
+            "All three Fundamentals are complete, with Defense and Focus both at 75.",
+    },
+
+    "ironjaw": {
+        "name": "Ironjaw",
+        "unlock_notice":
+            "Endurance reached 100 after 300 verified training minutes.",
+    },
+
+    "mantis": {
+        "name": "Neon Mantis",
+        "unlock_notice":
+            "You logged 60 verified Reaction minutes and reached 125 Focus.",
+    },
+
+    "brassbull": {
+        "name": "Brass Bull",
+        "unlock_notice":
+            "You logged 90 verified Power-mode minutes and reached 150 Power.",
+    },
+
+    "ghostbell": {
+        "name": "Ghost Bell",
+        "unlock_notice":
+            "You logged 90 verified Footwork-mode minutes and reached 150 Footwork.",
+    },
+
+    "undertow": {
+        "name": "The Undertow",
+        "unlock_notice":
+            "You logged 180 verified Endurance-mode minutes and reached 175 Endurance.",
+    },
+
+    "quarry": {
+        "name": "King Quarry",
+        "unlock_notice":
+            "You logged 180 verified Defense-mode minutes and reached 200 Defense.",
+    },
+
+    "showman": {
+        "name": "The Showman",
+        "unlock_notice":
+            "You completed 25 verified classes and reached 600 total stat points.",
+    },
+
+    "goliath9": {
+        "name": "Goliath-9",
+        "unlock_notice":
+            "You passed 1,000 verified training minutes.",
+    },
+
+    "frostbite": {
+        "name": "Frostbite",
+        "unlock_notice":
+            "Your best weekly training streak reached 8 weeks.",
+    },
+
+    "knucklebone": {
+        "name": "Knucklebone",
+        "unlock_notice":
+            "You completed 50 verified classes and crossed 500 recorded rounds.",
+    },
+
+    "starfall": {
+        "name": "Starfall",
+        "unlock_notice":
+            "Every Train mode now has at least 30 verified minutes, with 1,200 total stat points behind it.",
+    },
+
+    "underdog": {
+        "name": "The Underdog",
+        "unlock_notice":
+            "2,500 verified minutes. 2,000 stat points. 75 classes. A 12-week streak.",
+    },
+}
 
 AVATAR_ACHIEVEMENT_BADGES = {
     "first-strike": {
@@ -497,6 +589,8 @@ AVATAR_DEFAULT_CONFIG = {
     "version": AVATAR_VERSION,
 
     "presentation": "masc",
+
+    "legend_id": "none",
 
     "colors": {
         "skin": "#b8754f",
@@ -750,6 +844,20 @@ def clean_avatar_config(value, user_id: str | None = None):
     if presentation in ("masc", "fem"):
         clean["presentation"] = presentation
 
+    legend_id = safe_avatar_id(
+        value.get("legend_id"),
+        "none",
+    )
+
+    if (
+        legend_id != "none"
+        and legend_id
+        not in AVATAR_LEGENDS
+    ):
+        legend_id = "none"
+
+    clean["legend_id"] = legend_id
+
     colors = (
         value.get("colors")
         if isinstance(value.get("colors"), dict)
@@ -846,6 +954,35 @@ def clean_avatar_config(value, user_id: str | None = None):
                 clean["parts"]["badge"] = "none"
         except Exception:
             clean["parts"]["badge"] = "none"
+
+    selected_legend = (
+        clean.get("legend_id")
+        or "none"
+    )
+
+    if (
+        selected_legend != "none"
+        and user_id
+    ):
+        try:
+            unlocked_legends = (
+                get_unlocked_avatar_legends(
+                    user_id
+                )
+            )
+
+            if (
+                selected_legend
+                not in unlocked_legends
+            ):
+                clean["legend_id"] = (
+                    "none"
+                )
+
+        except Exception:
+            clean["legend_id"] = (
+                "none"
+            )
 
     clean["version"] = AVATAR_VERSION
 
@@ -2916,6 +3053,13 @@ def learn_session_finish(
         or {}
     )
 
+    timezone_name = str(
+        data.get(
+            "timezone"
+        )
+        or "UTC"
+    ).strip() or "UTC"
+
     try:
         row = learn_session_row(
             str(
@@ -3125,6 +3269,13 @@ def learn_session_finish(
                 notify_new=False,
             )
 
+            sync_progress_legend_unlocks(
+                uid,
+                stats_before,
+                notify_new=False,
+                timezone_name=timezone_name,
+            )
+
             existing_completion = (
                 supabase
                 .table("learn_completions")
@@ -3283,6 +3434,15 @@ def learn_session_finish(
                     )
                 )
 
+            legend_unlocks = (
+                sync_progress_legend_unlocks(
+                    uid,
+                    stats_after,
+                    notify_new=True,
+                    timezone_name=timezone_name,
+                )
+            )
+            
             return jsonify({
                 "status":
                     "ok",
@@ -3307,6 +3467,9 @@ def learn_session_finish(
 
                 "badge_unlocks":
                     badge_unlocks,
+
+                "legend_unlocks":
+                    legend_unlocks,
 
                 "stats":
                     stats_after,
@@ -3382,6 +3545,13 @@ def learn_session_finish(
                     notify_new=False,
                 )
 
+            sync_progress_legend_unlocks(
+                uid,
+                stats_before,
+                notify_new=False,
+                timezone_name=timezone_name,
+            )
+
             (
                 supabase
                 .table("learn_sessions")
@@ -3430,6 +3600,15 @@ def learn_session_finish(
                     )
                 )
 
+            legend_unlocks = (
+                sync_progress_legend_unlocks(
+                    uid,
+                    stats_after,
+                    notify_new=True,
+                    timezone_name=timezone_name,
+                )
+            )
+
             return jsonify({
                 "status":
                     "ok",
@@ -3468,6 +3647,9 @@ def learn_session_finish(
                 "badge_unlocks":
                     badge_unlocks,
 
+                "legend_unlocks":
+                    legend_unlocks,
+                
                 "stats":
                     stats_after,
 
@@ -4361,6 +4543,13 @@ def train_session_finish(
         or {}
     )
 
+    timezone_name = str(
+        data.get(
+            "timezone"
+        )
+        or "UTC"
+    ).strip() or "UTC"
+
     try:
         row = train_session_row(
             str(
@@ -4558,6 +4747,13 @@ def train_session_finish(
                 notify_new=False,
             )
 
+        sync_progress_legend_unlocks(
+            uid,
+            stats_before,
+            notify_new=False,
+            timezone_name=timezone_name,
+        )
+
         now = utc_now_iso()
 
         (
@@ -4608,6 +4804,15 @@ def train_session_finish(
                 )
             )
 
+        legend_unlocks = (
+            sync_progress_legend_unlocks(
+                uid,
+                stats_after,
+                notify_new=True,
+                timezone_name=timezone_name,
+            )
+        )
+
         return jsonify({
             "status":
                 "ok",
@@ -4645,6 +4850,9 @@ def train_session_finish(
 
             "badge_unlocks":
                 badge_unlocks,
+
+            "legend_unlocks":
+                legend_unlocks,
 
             "stats":
                 stats_after,
@@ -5807,6 +6015,13 @@ def profile_payload(profile: dict | None, viewer_id: str | None = None):
             notify_new=False,
         )
 
+        sync_progress_legend_unlocks(
+            profile_id,
+            stats,
+            notify_new=False,
+            timezone_name="UTC",
+        )
+
         if primary_gym:
             record_avatar_badge_unlock(
                 profile_id,
@@ -5820,6 +6035,76 @@ def profile_payload(profile: dict | None, viewer_id: str | None = None):
                 stats,
             )
         )
+
+        unlocked_legends = (
+            get_unlocked_avatar_legends(
+                profile_id,
+                stats,
+                timezone_name="UTC",
+            )
+        )
+
+        clean["unlocked_legends"] = (
+            sorted(
+                unlocked_legends
+            )
+        )
+
+        selected_legend = str(
+            clean
+            .get(
+                "avatar_config",
+                {},
+            )
+            .get(
+                "legend_id",
+                "none",
+            )
+            or "none"
+        ).strip().lower()
+
+        if (
+            selected_legend
+            != "none"
+            and selected_legend
+            not in unlocked_legends
+        ):
+            clean[
+                "avatar_config"
+            ][
+                "legend_id"
+            ] = "none"
+
+            try:
+                (
+                    supabase
+                    .table(
+                        "profiles"
+                    )
+                    .update({
+                        "avatar_config":
+                            clean[
+                                "avatar_config"
+                            ],
+
+                        "avatar_version":
+                            AVATAR_VERSION,
+
+                        "avatar_updated_at":
+                            utc_now_iso(),
+
+                        "updated_at":
+                            utc_now_iso(),
+                    })
+                    .eq(
+                        "id",
+                        profile_id,
+                    )
+                    .execute()
+                )
+
+            except Exception:
+                pass
 
     return clean
 
@@ -7911,6 +8196,695 @@ def get_unlocked_avatar_badges(
         | load_persisted_avatar_badges(user_id)
     )
 
+def load_persisted_avatar_legends(
+    user_id: str | None,
+):
+    if not user_id:
+        return set()
+
+    try:
+        res = (
+            supabase
+            .table(
+                "avatar_legend_unlocks"
+            )
+            .select(
+                "legend_id"
+            )
+            .eq(
+                "user_id",
+                user_id,
+            )
+            .execute()
+        )
+
+        return {
+            str(
+                row.get(
+                    "legend_id"
+                )
+                or ""
+            ).strip().lower()
+
+            for row
+            in (
+                res.data
+                or []
+            )
+
+            if str(
+                row.get(
+                    "legend_id"
+                )
+                or ""
+            ).strip().lower()
+            in AVATAR_LEGENDS
+        }
+
+    except Exception:
+        return set()
+
+
+def load_test_avatar_legend_ids(
+    user_id: str | None,
+):
+    if (
+        not user_id
+        or not is_developer_user(
+            user_id
+        )
+    ):
+        return set()
+
+    try:
+        res = (
+            supabase
+            .table(
+                "profiles"
+            )
+            .select(
+                "legend_test_unlock"
+            )
+            .eq(
+                "id",
+                user_id,
+            )
+            .limit(1)
+            .execute()
+        )
+
+        if not res.data:
+            return set()
+
+        raw = str(
+            res.data[0].get(
+                "legend_test_unlock"
+            )
+            or ""
+        ).strip().lower()
+
+        if not raw:
+            return set()
+
+        requested = {
+            item
+            for item
+            in re.split(
+                r"[\s,;]+",
+                raw,
+            )
+            if item
+        }
+
+        if "all" in requested:
+            return set(
+                AVATAR_LEGENDS.keys()
+            )
+
+        return {
+            legend_id
+            for legend_id
+            in requested
+            if legend_id
+            in AVATAR_LEGENDS
+        }
+
+    except Exception:
+        return set()
+
+
+def legend_train_mode_minutes(
+    user_id: str | None,
+):
+    seconds = {
+        mode: 0
+        for mode
+        in TRAIN_MODES
+    }
+
+    if not user_id:
+        return {
+            mode: 0
+            for mode
+            in TRAIN_MODES
+        }
+
+    try:
+        rows = fetch_paged_rows(
+            lambda: (
+                supabase
+                .table(
+                    "train_sessions"
+                )
+                .select(
+                    "mode,"
+                    "verified_active_seconds"
+                )
+                .eq(
+                    "user_id",
+                    user_id,
+                )
+                .eq(
+                    "status",
+                    "completed",
+                )
+            )
+        )
+
+        for row in rows:
+            mode = str(
+                row.get(
+                    "mode"
+                )
+                or ""
+            ).strip().lower()
+
+            if mode not in TRAIN_MODES:
+                continue
+
+            seconds[mode] += max(
+                0,
+                safe_int(
+                    row.get(
+                        "verified_active_seconds"
+                    ),
+                    0,
+                ),
+            )
+
+    except Exception:
+        pass
+
+    return {
+        mode:
+            max(
+                0,
+                total_seconds
+                // 60,
+            )
+
+        for (
+            mode,
+            total_seconds,
+        )
+        in seconds.items()
+    }
+
+
+def legend_ids_from_progress(
+    user_id: str | None,
+    stats: dict | None = None,
+    timezone_name: str | None = None,
+):
+    if not user_id:
+        return set()
+
+    stats = (
+        stats
+        or calculate_user_stats(
+            user_id
+        )
+    )
+
+    stat_points = (
+        stats.get(
+            "stat_points"
+        )
+        if isinstance(
+            stats.get(
+                "stat_points"
+            ),
+            dict,
+        )
+        else {}
+    )
+
+    def stat(
+        key,
+    ):
+        return max(
+            0,
+            safe_int(
+                stat_points.get(
+                    key
+                ),
+                0,
+            ),
+        )
+
+    total_points = max(
+        0,
+        safe_int(
+            stats.get(
+                "total_points"
+            ),
+            0,
+        ),
+    )
+
+    total_minutes = max(
+        0,
+        safe_int(
+            stats.get(
+                "total_minutes"
+            ),
+            0,
+        ),
+    )
+
+    total_rounds = max(
+        0,
+        safe_int(
+            stats.get(
+                "total_rounds"
+            ),
+            0,
+        ),
+    )
+
+    completed_classes = max(
+        0,
+        safe_int(
+            stats.get(
+                "completed_classes"
+            ),
+            0,
+        ),
+    )
+
+    fundamentals = max(
+        0,
+        safe_int(
+            stats.get(
+                "learn_lessons_completed"
+            ),
+            0,
+        ),
+    )
+
+    mode_minutes = (
+        legend_train_mode_minutes(
+            user_id
+        )
+    )
+
+    try:
+        streak = (
+            weekly_streak_payload(
+                user_id,
+                timezone_name
+                or "UTC",
+            )
+        )
+
+        best_streak = max(
+            0,
+            safe_int(
+                streak.get(
+                    "best_streak_weeks"
+                ),
+                0,
+            ),
+        )
+
+    except Exception:
+        best_streak = 0
+
+    earned = set()
+
+    if stat("speed") >= 100:
+        earned.add(
+            "redline"
+        )
+
+    if stat("power") >= 100:
+        earned.add(
+            "wildfire"
+        )
+
+    if (
+        fundamentals >= 3
+        and stat("defense") >= 75
+        and stat("focus") >= 75
+    ):
+        earned.add(
+            "velvet"
+        )
+
+    if (
+        stat("endurance") >= 100
+        and total_minutes >= 300
+    ):
+        earned.add(
+            "ironjaw"
+        )
+
+    if (
+        stat("focus") >= 125
+        and mode_minutes.get(
+            "reaction",
+            0,
+        ) >= 60
+    ):
+        earned.add(
+            "mantis"
+        )
+
+    if (
+        stat("power") >= 150
+        and mode_minutes.get(
+            "power",
+            0,
+        ) >= 90
+    ):
+        earned.add(
+            "brassbull"
+        )
+
+    if (
+        stat("footwork") >= 150
+        and mode_minutes.get(
+            "footwork",
+            0,
+        ) >= 90
+    ):
+        earned.add(
+            "ghostbell"
+        )
+
+    if (
+        stat("endurance") >= 175
+        and mode_minutes.get(
+            "endurance",
+            0,
+        ) >= 180
+    ):
+        earned.add(
+            "undertow"
+        )
+
+    if (
+        stat("defense") >= 200
+        and mode_minutes.get(
+            "defense",
+            0,
+        ) >= 180
+    ):
+        earned.add(
+            "quarry"
+        )
+
+    if (
+        completed_classes >= 25
+        and total_points >= 600
+    ):
+        earned.add(
+            "showman"
+        )
+
+    if total_minutes >= 1000:
+        earned.add(
+            "goliath9"
+        )
+
+    if best_streak >= 8:
+        earned.add(
+            "frostbite"
+        )
+
+    if (
+        completed_classes >= 50
+        and total_rounds >= 500
+    ):
+        earned.add(
+            "knucklebone"
+        )
+
+    if (
+        total_points >= 1200
+        and all(
+            mode_minutes.get(
+                mode,
+                0,
+            ) >= 30
+            for mode
+            in TRAIN_MODES
+        )
+    ):
+        earned.add(
+            "starfall"
+        )
+
+    if (
+        total_minutes >= 2500
+        and total_points >= 2000
+        and completed_classes >= 75
+        and best_streak >= 12
+    ):
+        earned.add(
+            "underdog"
+        )
+
+    return earned
+
+
+def record_avatar_legend_unlock(
+    user_id: str | None,
+    legend_id: str,
+    notify: bool = False,
+):
+    legend_id = str(
+        legend_id
+        or ""
+    ).strip().lower()
+
+    meta = AVATAR_LEGENDS.get(
+        legend_id
+    )
+
+    if (
+        not user_id
+        or not meta
+    ):
+        return False
+
+    try:
+        existing = (
+            supabase
+            .table(
+                "avatar_legend_unlocks"
+            )
+            .select(
+                "legend_id"
+            )
+            .eq(
+                "user_id",
+                user_id,
+            )
+            .eq(
+                "legend_id",
+                legend_id,
+            )
+            .limit(1)
+            .execute()
+        )
+
+        if existing.data:
+            return False
+
+        try:
+            inserted = (
+                supabase
+                .table(
+                    "avatar_legend_unlocks"
+                )
+                .insert({
+                    "user_id":
+                        user_id,
+
+                    "legend_id":
+                        legend_id,
+
+                    "unlocked_at":
+                        utc_now_iso(),
+
+                    "source":
+                        "progress",
+                })
+                .execute()
+            )
+
+            if not inserted.data:
+                verify = (
+                    supabase
+                    .table(
+                        "avatar_legend_unlocks"
+                    )
+                    .select(
+                        "legend_id"
+                    )
+                    .eq(
+                        "user_id",
+                        user_id,
+                    )
+                    .eq(
+                        "legend_id",
+                        legend_id,
+                    )
+                    .limit(1)
+                    .execute()
+                )
+
+                if not verify.data:
+                    return False
+
+        except Exception:
+            verify = (
+                supabase
+                .table(
+                    "avatar_legend_unlocks"
+                )
+                .select(
+                    "legend_id"
+                )
+                .eq(
+                    "user_id",
+                    user_id,
+                )
+                .eq(
+                    "legend_id",
+                    legend_id,
+                )
+                .limit(1)
+                .execute()
+            )
+
+            if verify.data:
+                return False
+
+            raise
+
+        if notify:
+            create_notification(
+                user_id,
+                None,
+                (
+                    "legend_unlock:"
+                    + legend_id
+                ),
+                (
+                    "Legend unlocked · "
+                    + str(
+                        meta.get(
+                            "name"
+                        )
+                        or "Legend"
+                    )
+                ),
+                (
+                    str(
+                        meta.get(
+                            "unlock_notice"
+                        )
+                        or ""
+                    )
+                    + " Open Avatar → Legends to equip it."
+                ),
+                "avatar_legend",
+                None,
+            )
+
+        return True
+
+    except Exception as e:
+        print(
+            "[avatar-legend] "
+            "unlock failed "
+            f"user={user_id} "
+            f"legend={legend_id}: {e}"
+        )
+
+        return False
+
+
+def sync_progress_legend_unlocks(
+    user_id: str | None,
+    stats: dict | None = None,
+    notify_new: bool = False,
+    timezone_name: str | None = None,
+):
+    if not user_id:
+        return []
+
+    stats = (
+        stats
+        or calculate_user_stats(
+            user_id
+        )
+    )
+
+    earned = (
+        legend_ids_from_progress(
+            user_id,
+            stats,
+            timezone_name,
+        )
+    )
+
+    newly_unlocked = []
+
+    for legend_id in (
+        AVATAR_LEGENDS.keys()
+    ):
+        if legend_id not in earned:
+            continue
+
+        unlocked_now = (
+            record_avatar_legend_unlock(
+                user_id,
+                legend_id,
+                notify=notify_new,
+            )
+        )
+
+        if unlocked_now:
+            newly_unlocked.append(
+                legend_id
+            )
+
+    return newly_unlocked
+
+
+def get_unlocked_avatar_legends(
+    user_id: str | None,
+    stats: dict | None = None,
+    timezone_name: str | None = None,
+):
+    if not user_id:
+        return set()
+
+    stats = (
+        stats
+        or calculate_user_stats(
+            user_id
+        )
+    )
+
+    return (
+        load_persisted_avatar_legends(
+            user_id
+        )
+        | load_test_avatar_legend_ids(
+            user_id
+        )
+        | legend_ids_from_progress(
+            user_id,
+            stats,
+            timezone_name,
+        )
+    )
+
+
 def compute_listen_required_seconds(session_row: dict, audio_duration_seconds: int | None = None):
     existing = safe_int(session_row.get("listen_required_seconds"), 0)
     if existing > 0:
@@ -8074,6 +9048,13 @@ def listen_heartbeat(job_id):
     job_id = str(job_id or "").strip()
     data = request.get_json(force=True, silent=True) or {}
 
+        timezone_name = str(
+        data.get(
+            "timezone"
+        )
+        or "UTC"
+    ).strip() or "UTC"
+
     listened_delta_seconds = max(0, min(20, safe_int(data.get("listened_delta_seconds"), 0)))
     audio_position_seconds = max(0, safe_int(data.get("audio_position_seconds"), 0))
     audio_duration_seconds = max(0, safe_int(data.get("audio_duration_seconds"), 0))
@@ -8128,6 +9109,7 @@ def listen_heartbeat(job_id):
 
         completed_now = False
         badge_unlocks = []
+        legend_unlocks = []
 
         if (
             not already_complete
@@ -8142,6 +9124,13 @@ def listen_heartbeat(job_id):
                 uid,
                 stats_before,
                 notify_new=False,
+            )
+
+            sync_progress_legend_unlocks(
+                uid,
+                stats_before,
+                notify_new=False,
+                timezone_name=timezone_name,
             )
 
             completed_now = True
@@ -8164,6 +9153,15 @@ def listen_heartbeat(job_id):
                 uid,
                 stats_after,
                 notify_new=True,
+            )
+
+            legend_unlocks = (
+                sync_progress_legend_unlocks(
+                    uid,
+                    stats_after,
+                    notify_new=True,
+                    timezone_name=timezone_name,
+                )
             )
 
         post = None
@@ -8195,6 +9193,8 @@ def listen_heartbeat(job_id):
             "post_created": bool(post),
             "post_error": post_error,
             "badge_unlocks": badge_unlocks,
+            "legend_unlocks":
+                legend_unlocks,
         }), 200
 
     except Exception as e:
