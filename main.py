@@ -330,61 +330,61 @@ AVATAR_LEGENDS = {
     "redline": {
         "name": "Redline",
         "unlock_notice":
-            "Speed reached 100.",
+            "Your Speed hit 100.",
     },
 
     "wildfire": {
         "name": "Wildfire",
         "unlock_notice":
-            "Power reached 100.",
+            "Your Power hit 100.",
     },
 
     "velvet": {
         "name": "Velvet Knife",
         "unlock_notice":
-            "All three Fundamentals are complete, with Defense and Focus both at 75.",
+            "You finished all three Fundamentals and reached 75 Defense and 75 Focus.",
     },
 
     "ironjaw": {
         "name": "Ironjaw",
         "unlock_notice":
-            "Endurance reached 100 after 300 verified training minutes.",
+            "You reached 100 Endurance with 300 verified training minutes behind it.",
     },
 
     "mantis": {
         "name": "Neon Mantis",
         "unlock_notice":
-            "You logged 60 verified Reaction minutes and reached 125 Focus.",
+            "You reached 60 verified Reaction minutes and 125 Focus.",
     },
 
     "brassbull": {
         "name": "Brass Bull",
         "unlock_notice":
-            "You logged 90 verified Power-mode minutes and reached 150 Power.",
+            "You reached 90 verified Power minutes and 150 Power.",
     },
 
     "ghostbell": {
         "name": "Ghost Bell",
         "unlock_notice":
-            "You logged 90 verified Footwork-mode minutes and reached 150 Footwork.",
+            "You reached 90 verified Footwork minutes and 150 Footwork.",
     },
 
     "undertow": {
         "name": "The Undertow",
         "unlock_notice":
-            "You logged 180 verified Endurance-mode minutes and reached 175 Endurance.",
+            "You reached 180 verified Endurance minutes and 175 Endurance.",
     },
 
     "quarry": {
         "name": "King Quarry",
         "unlock_notice":
-            "You logged 180 verified Defense-mode minutes and reached 200 Defense.",
+            "You reached 180 verified Defense minutes and 200 Defense.",
     },
 
     "showman": {
         "name": "The Showman",
         "unlock_notice":
-            "You completed 25 verified classes and reached 600 total stat points.",
+            "You finished your 25th verified class and passed 600 total stat points.",
     },
 
     "goliath9": {
@@ -402,19 +402,19 @@ AVATAR_LEGENDS = {
     "knucklebone": {
         "name": "Knucklebone",
         "unlock_notice":
-            "You completed 50 verified classes and crossed 500 recorded rounds.",
+            "You finished 50 verified classes and passed 500 recorded rounds.",
     },
 
     "starfall": {
         "name": "Starfall",
         "unlock_notice":
-            "Every Train mode now has at least 30 verified minutes, with 1,200 total stat points behind it.",
+            "You logged at least 30 verified minutes in every Train mode and passed 1,200 total stat points.",
     },
 
     "underdog": {
         "name": "The Underdog",
         "unlock_notice":
-            "2,500 verified minutes. 2,000 stat points. 75 classes. A 12-week streak.",
+            "You reached 2,500 verified minutes, 2,000 stat points, 75 classes, and a 12-week streak.",
     },
 }
 
@@ -8773,7 +8773,7 @@ def record_avatar_legend_unlock(
                     + legend_id
                 ),
                 (
-                    "Legend unlocked · "
+                    "New Legend · "
                     + str(
                         meta.get(
                             "name"
@@ -8788,7 +8788,15 @@ def record_avatar_legend_unlock(
                         )
                         or ""
                     )
-                    + " Open Avatar → Legends to equip it."
+                    + " "
+                    + str(
+                        meta.get(
+                            "name"
+                        )
+                        or "A new Legend"
+                    )
+                    + " is now yours. "
+                    "Open Avatar → Legends to equip it."
                 ),
                 "avatar_legend",
                 None,
