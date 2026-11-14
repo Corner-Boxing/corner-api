@@ -1372,6 +1372,7 @@ def me():
     return jsonify({
         "signed_in": True,
         "user_id": uid,
+        "account_setup_required": not corner_commerce.ready(corner_commerce.account(uid)),
 
         "plan_tier":
             effective_plan[
@@ -12455,6 +12456,18 @@ def read_profile(profile_id):
             "details": str(e),
         }), 500
 
+
+# Keep the existing promo/profile access resolver, then add Stripe access.
+from corner_commerce import install_commerce
+
+corner_commerce = install_commerce(
+    app,
+    supabase,
+    get_verified_user_id_from_request,
+    get_effective_plan,
+    is_developer_user,
+)
+get_effective_plan = corner_commerce.effective_plan
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=10000)
